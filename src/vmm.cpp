@@ -646,7 +646,7 @@ bool Vmm::init(bool zero_ram) {
                 MAP_SHARED, ram_memfd_, 0);
     if (ram_ == MAP_FAILED) { perror("mmap ram"); return false; }
     if (zero_ram) memset(ram_, 0, ram_bytes_);
-    DBG("init: ram=%p memfd=%d size=%zuMB", ram_, ram_memfd_, ram_bytes_ >> 20);
+    DBG("init: ram=%p memfd=%d size=%zuMB hugetlb=%d", ram_, ram_memfd_, ram_bytes_ >> 20, use_hugetlb_);
 
     if (!set_memslot(0, 0, ram_, ram_bytes_)) return false;
 
@@ -2193,6 +2193,16 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
         vhost_net_setup();
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &ts2);
+
+    auto us_diff = [](struct timespec &a, struct timespec &b) -> long {
+        return (b.tv_sec - a.tv_sec) * 1000000L + (b.tv_nsec - a.tv_nsec) / 1000L;
+    };
+    DBG("restore_snapshot breakdown: ram_copy=%.2fms kvm_state=%.2fms total=%.2fms",
+        us_diff(ts0, ts1) / 1000.0,
+        us_diff(ts1, ts2) / 1000.0,
+        us_diff(ts0, ts2) / 1000.0);
+
     ignore_next_signal_ = true;
     return true;
 }
@@ -2420,6 +2430,12 @@ static const char *find_arg(int argc, char **argv, const char *flag) {
     for (int i = 1; i < argc - 1; i++)
         if (strcmp(argv[i], flag) == 0) return argv[i + 1];
     return nullptr;
+}
+
+static bool has_flag(int argc, char **argv, const char *flag) {
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], flag) == 0) return true;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
