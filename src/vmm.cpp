@@ -2028,10 +2028,13 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
         return false;
     }
 
+    struct timespec ts0, ts1, ts2;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
     // Restore guest RAM -- sparse copy (skip zero pages).
     // The memfd starts zeroed, so we only copy non-zero (dirty) pages.
     // With a dirty bitmap we skip zero pages entirely (no reads).
-    // Without one, we scan each page with a fast OR-reduce.
+    // Uses parallel memcpy with pre-faulted destination pages.
     {
         constexpr size_t PAGE = 4096;
         const uint8_t *src = (const uint8_t *)snap.ram;
@@ -2257,6 +2260,9 @@ bool Vmm::save_snapshot_file(const char *path) {
 }
 
 bool Vmm::restore_snapshot_file(const char *path) {
+    struct timespec tf0, tf1, tf2, tf3;
+    clock_gettime(CLOCK_MONOTONIC, &tf0);
+
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open snap"); return false; }
 
@@ -2687,6 +2693,7 @@ int main(int argc, char **argv) {
         const char *snap_path   = argv[2];
         const char *share_dir   = find_arg(argc, argv, "--share");
         const char *config_path = find_arg(argc, argv, "--config");
+        const char *ct_str      = find_arg(argc, argv, "--copy-threads");
         // Legacy support
         const char *entrypoint  = find_arg(argc, argv, "--entrypoint");
 
