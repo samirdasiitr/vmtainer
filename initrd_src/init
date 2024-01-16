@@ -1,0 +1,63 @@
+#!/bin/sh
+mkdir -p /proc /sys /dev /tmp /mnt /share
+mount -t devtmpfs devtmpfs /dev  2>/dev/null || true
+mount -t proc     proc     /proc 2>/dev/null || true
+mount -t sysfs    sysfs    /sys  2>/dev/null || true
+
+log() { echo "$1" > /dev/kmsg 2>/dev/null || true; }
+
+log "VMTAINER: init starting"
+
+# Signal VMM: snapshot BEFORE mounting virtiofs.
+# Restored/cloned VMs get a clean FUSE_INIT with their own virtiofsd.
+log "VMTAINER: signalling snapshot"
+/bin/signal_vmm
+
+# After snapshot restore -- mount virtiofs (clean FUSE session)
+log "VMTAINER: mounting virtiofs"
+mount -t virtiofs myfs /share 2>/tmp/mount_err
+if [ $? -ne 0 ]; then
+    log "VMTAINER: mount failed: $(cat /tmp/mount_err 2>/dev/null)"
+    exec /bin/halt -f
+fi
+log "VMTAINER: virtiofs mounted OK"
+
+# Read entrypoint from .entrypoint file (written by VMM host)
+ENTRYPOINT=""
+if [ -f /share/.entrypoint ]; then
+    ENTRYPOINT=$(head -1 /share/.entrypoint)
+fi
+
+# If no entrypoint specified, fall back to running init.py (legacy)
+if [ -z "$ENTRYPOINT" ]; then
+    log "VMTAINER: no entrypoint, running legacy init.py"
+    if [ -f /share/init.py ]; then
+        sh /share/init.py > /tmp/out 2>&1
+        log "VMTAINER: output: $(cat /tmp/out)"
+    else
+        log "VMTAINER: no init.py found"
+    fi
+    log "VMTAINER: halting"
+    exec /bin/halt -f
+fi
+
+# Chroot into virtiofs rootfs and run the entrypoint.
+# The shared directory is expected to be a full rootfs (e.g., OCI image).
+log "VMTAINER: chroot into virtiofs, entrypoint=$ENTRYPOINT"
+
+# Set up pseudo-filesystems inside the new root
+mkdir -p /share/proc /share/sys /share/dev /share/tmp
+mount --move /proc /share/proc 2>/dev/null || mount -t proc proc /share/proc
+mount --move /sys  /share/sys  2>/dev/null || mount -t sysfs sysfs /share/sys
+mount --move /dev  /share/dev  2>/dev/null || mount -t devtmpfs devtmpfs /share/dev
+
+# Create /dev/kmsg if missing
+[ -e /share/dev/kmsg ] || mknod /share/dev/kmsg c 1 11 2>/dev/null
+
+# Run the entrypoint inside the chroot as a subprocess.
+# When it finishes, we (init / PID 1) do the halt.
+log "VMTAINER: running entrypoint"
+chroot /share $ENTRYPOINT
+RC=$?
+log "VMTAINER: entrypoint exited ($RC)"
+exec /bin/halt -f
