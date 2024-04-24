@@ -1,4 +1,4 @@
-// vmm.cpp -- Minimal KVM VMM with in-memory snapshots, virtiofs, and cloning
+// vmm.cpp -- vmtainer: Minimal KVM VMM with snapshots, virtiofs, vhost-net
 //
 // Usage:
 //   vmtainer boot   <bzImage> <initrd> --share <dir> [--snapshot <path>]
@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <net/if.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -25,8 +26,66 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <linux/if_tun.h>
+#include <poll.h>
+#include <algorithm>
 #include <linux/limits.h>
 #include <linux/kvm.h>
+
+// vhost-net struct and ioctl definitions (avoid including linux/vhost.h
+// which pulls in linux/virtio_ring.h with C-incompatible casts for C++)
+
+struct vhost_memory_region {
+    uint64_t guest_phys_addr;
+    uint64_t memory_size;
+    uint64_t userspace_addr;
+    uint64_t flags_padding;
+};
+
+// Base struct for ioctl number encoding (matches kernel's flexible array size)
+struct vhost_memory_base {
+    uint32_t nregions;
+    uint32_t padding;
+};
+
+// Usable struct with one region inline
+struct vhost_memory {
+    uint32_t nregions;
+    uint32_t padding;
+    struct vhost_memory_region regions[1];
+};
+
+struct vhost_vring_state {
+    unsigned int index;
+    unsigned int num;
+};
+
+struct vhost_vring_file {
+    unsigned int index;
+    int fd;
+};
+
+struct vhost_vring_addr {
+    unsigned int index;
+    unsigned int flags;
+    uint64_t desc_user_addr;
+    uint64_t used_user_addr;
+    uint64_t avail_user_addr;
+    uint64_t log_guest_addr;
+};
+
+// ioctl numbers must encode the correct struct size
+#define VHOST_VIRTIO 0xAF
+#define VHOST_GET_FEATURES      _IOR(VHOST_VIRTIO, 0x00, __u64)
+#define VHOST_SET_FEATURES      _IOW(VHOST_VIRTIO, 0x00, __u64)
+#define VHOST_SET_OWNER         _IO(VHOST_VIRTIO, 0x01)
+#define VHOST_SET_MEM_TABLE     _IOW(VHOST_VIRTIO, 0x03, struct vhost_memory_base)
+#define VHOST_SET_VRING_NUM     _IOW(VHOST_VIRTIO, 0x10, struct vhost_vring_state)
+#define VHOST_SET_VRING_ADDR    _IOW(VHOST_VIRTIO, 0x11, struct vhost_vring_addr)
+#define VHOST_SET_VRING_BASE    _IOW(VHOST_VIRTIO, 0x12, struct vhost_vring_state)
+#define VHOST_SET_VRING_KICK    _IOW(VHOST_VIRTIO, 0x20, struct vhost_vring_file)
+#define VHOST_SET_VRING_CALL    _IOW(VHOST_VIRTIO, 0x21, struct vhost_vring_file)
+#define VHOST_NET_SET_BACKEND   _IOW(VHOST_VIRTIO, 0x30, struct vhost_vring_file)
 #include <asm/bootparam.h>
 
 #include "boot.hpp"
@@ -48,8 +107,14 @@ static constexpr uint64_t VIRTIO_MMIO_GPA  = 0xd0001000ULL;
 static constexpr uint64_t VIRTIO_MMIO_SIZE = 0x1000;
 static constexpr uint32_t VIRTIO_MMIO_IRQ  = 5;
 
+// Virtio-MMIO region for the virtio-net device (second device).
+static constexpr uint64_t VIRTIO_NET_MMIO_GPA  = 0xd0002000ULL;
+static constexpr uint64_t VIRTIO_NET_MMIO_SIZE = 0x1000;
+static constexpr uint32_t VIRTIO_NET_MMIO_IRQ  = 6;
+
 // Virtio device / vendor IDs
 static constexpr uint32_t VIRTIO_DEV_FS     = 26;  // virtio type for virtiofs
+static constexpr uint32_t VIRTIO_DEV_NET    = 1;   // virtio type for network
 static constexpr uint32_t VIRTIO_VENDOR_ID  = 0x554d4551; // "QEMU"
 
 // Virtio MMIO register offsets (virtio 1.0+ MMIO transport, spec 4.2.2)
@@ -93,6 +158,60 @@ static constexpr uint64_t VIRT_F_RING_PACKED  = (1ULL << 34);
 struct VirtioFsConfig {
     char tag[36];
     uint32_t num_request_queues;
+};
+
+// Virtio-net feature bits
+static constexpr uint64_t VIRTIO_NET_F_CSUM  = (1ULL << 0);
+static constexpr uint64_t VIRTIO_NET_F_GUEST_CSUM = (1ULL << 1);
+static constexpr uint64_t VIRTIO_NET_F_MAC   = (1ULL << 5);
+static constexpr uint64_t VIRTIO_NET_F_STATUS = (1ULL << 16);
+static constexpr uint32_t VIRTIO_NET_S_LINK_UP = 1;
+
+// Virtio-net config space (matches kernel's struct virtio_net_config)
+struct __attribute__((packed)) VirtioNetConfig {
+    uint8_t  mac[6];
+    uint16_t status;        // VIRTIO_NET_S_LINK_UP
+    uint16_t max_vq_pairs;
+    uint16_t mtu;
+};
+
+// Virtio-net header prepended to every packet in the virtqueue
+struct __attribute__((packed)) VirtioNetHdr {
+    uint8_t  flags;
+    uint8_t  gso_type;
+    uint16_t hdr_len;
+    uint16_t gso_size;
+    uint16_t csum_start;
+    uint16_t csum_offset;
+    uint16_t num_buffers;
+};
+static_assert(sizeof(VirtioNetHdr) == 12, "virtio_net_hdr_v1 must be 12 bytes");
+
+// Split virtqueue ring structures (for direct descriptor processing)
+struct VringDesc {
+    uint64_t addr;
+    uint32_t len;
+    uint16_t flags;
+    uint16_t next;
+};
+#define VRING_DESC_F_NEXT     1
+#define VRING_DESC_F_WRITE    2
+
+struct VringAvail {
+    uint16_t flags;
+    uint16_t idx;
+    uint16_t ring[];    // variable length
+};
+
+struct VringUsedElem {
+    uint32_t id;
+    uint32_t len;
+};
+
+struct VringUsed {
+    uint16_t flags;
+    uint16_t idx;
+    VringUsedElem ring[];  // variable length
 };
 
 // Virtqueue state
@@ -211,7 +330,7 @@ struct __attribute__((packed)) VhostUserMsg {
 // ---------------------------------------------------------------------------
 
 #define SNAP_MAGIC   0x48594C54534E4150ULL
-#define SNAP_VERSION 5
+#define SNAP_VERSION 6
 #define MAX_MSRS     256
 #define XSAVE_SIZE   8192
 
@@ -252,6 +371,21 @@ struct SnapshotHeader {
         uint64_t device;
     } vq_state[2]; // hiprio + request queue
 
+    // Virtio-net device state
+    uint32_t net_status;
+    uint32_t net_drv_features_lo;
+    uint32_t net_drv_features_hi;
+    uint32_t net_num_vqs;
+    struct {
+        uint32_t num;
+        uint32_t ready;
+        uint64_t desc;
+        uint64_t driver;
+        uint64_t device;
+    } net_vq_state[2]; // RX + TX
+    uint8_t  net_mac[6];
+    uint8_t  net_pad[2]; // alignment
+
     // Followed in memory / on disk by:
     //   xsave_buf[xsave_size]
     //   kvm_cpuid_entry2[cpuid_nent]
@@ -291,7 +425,11 @@ public:
 
     // Virtio-fs
     bool start_virtiofsd(const char *shared_dir);
-    bool setup_virtio_fs();
+    bool setup_virtio_fs(bool add_cmdline = false);
+
+    // Virtio-net
+    bool setup_virtio_net(const uint8_t mac[6], bool add_cmdline = true);
+    bool connect_tap(const char *tap_name);
 
     // Run
     int run();  // 0 = halt, 1 = snapshot signal, -1 = error
@@ -301,6 +439,8 @@ public:
     bool restore_snapshot(const Snapshot &snap);
     bool save_snapshot_file(const char *path);
     bool restore_snapshot_file(const char *path);
+
+    friend void *net_thread_func(void *arg);
 
 private:
     void cleanup();
@@ -319,13 +459,19 @@ private:
     void serial_in(uint16_t port, uint8_t *data);
     void serial_out(uint16_t port, uint8_t data);
 
-    // Virtio MMIO
+    // Virtio MMIO (virtiofs)
     void virtio_mmio_read(uint64_t off, uint8_t *data, uint32_t len);
     void virtio_mmio_write(uint64_t off, const uint8_t *data, uint32_t len);
     void virtio_kick(uint32_t qidx);
     void check_virtio_irqs();
     void start_irq_thread();
     static void *irq_thread_func(void *arg);
+
+    // Virtio MMIO (net)
+    void net_mmio_read(uint64_t off, uint8_t *data, uint32_t len);
+    void net_mmio_write(uint64_t off, const uint8_t *data, uint32_t len);
+    bool vhost_net_setup();  // wire up vhost-net kernel backend
+    int  open_tap(const char *name);
 
     // Vhost-user
     bool vu_connect(const char *sock_path);
@@ -372,6 +518,22 @@ private:
     uint32_t   shm_sel_           = 0;
     VirtioFsConfig  fs_config_    = {};
     bool       virtio_active_     = false;
+
+    // Virtio-net device state
+    static constexpr int NET_NUM_QUEUES = 2; // RX + TX
+    Virtqueue  net_vqs_[NET_NUM_QUEUES];
+    uint32_t   net_features_sel_ = 0;
+    uint32_t   net_drv_features_sel_ = 0;
+    uint64_t   net_drv_features_ = 0;
+    uint32_t   net_status_       = 0;
+    uint32_t   net_queue_sel_    = 0;
+    uint32_t   net_irq_status_   = 0;
+    VirtioNetConfig net_config_  = {};
+    bool       net_active_       = false;
+    int        tap_fd_           = -1;
+    int        vhost_fd_         = -1;  // /dev/vhost-net fd (unused in userspace mode)
+    int        net_wakeup_fd_    = -1;  // wakeup eventfd for net thread
+    volatile bool net_thread_stop_ = false;
 
     // IRQ thread: monitors call_fds and interrupts KVM_RUN
     pthread_t  irq_thread_       = 0;
@@ -1184,27 +1346,405 @@ bool Vmm::start_virtiofsd(const char *shared_dir) {
         return false;
     }
 
-    // Add the virtio_mmio device to the kernel command line
-    char mmio_param[128];
-    snprintf(mmio_param, sizeof(mmio_param),
-             " virtio_mmio.device=0x%lx@0x%llx:%u",
-             VIRTIO_MMIO_SIZE,
-             (unsigned long long)VIRTIO_MMIO_GPA,
-             VIRTIO_MMIO_IRQ);
-    strncat(cmdline_, mmio_param, sizeof(cmdline_) - strlen(cmdline_) - 1);
-
     // Set up the fs config with tag "myfs"
-    memset(&fs_config_, 0, sizeof(fs_config_));
-    strncpy(fs_config_.tag, "myfs", sizeof(fs_config_.tag));
-    fs_config_.num_request_queues = 1;
+    setup_virtio_fs();
 
     printf("[VMM] virtiofs connected, tag='myfs'\n");
     return true;
 }
 
-bool Vmm::setup_virtio_fs() {
-    // nothing extra needed -- MMIO traps are handled in run()
+bool Vmm::setup_virtio_fs(bool add_cmdline) {
+    // Set up fs config so MMIO reads return proper values
+    memset(&fs_config_, 0, sizeof(fs_config_));
+    strncpy(fs_config_.tag, "myfs", sizeof(fs_config_.tag));
+    fs_config_.num_request_queues = 1;
+
+    // Set default device features if not already set by vu_early_init
+    if (vu_features_ == 0) {
+        vu_features_ = VIRT_F_VERSION_1;
+    }
+
+    if (add_cmdline) {
+        char mmio_param[128];
+        snprintf(mmio_param, sizeof(mmio_param),
+                 " virtio_mmio.device=0x%lx@0x%llx:%u",
+                 VIRTIO_MMIO_SIZE,
+                 (unsigned long long)VIRTIO_MMIO_GPA,
+                 VIRTIO_MMIO_IRQ);
+        strncat(cmdline_, mmio_param, sizeof(cmdline_) - strlen(cmdline_) - 1);
+    }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Virtio-net: TAP, MMIO transport, TX/RX
+// ---------------------------------------------------------------------------
+
+int Vmm::open_tap(const char *name) {
+    int fd = open("/dev/net/tun", O_RDWR | O_CLOEXEC);
+    if (fd < 0) { perror("open /dev/net/tun"); return -1; }
+
+    struct ifreq ifr = {};
+    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+    strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+        perror("TUNSETIFF");
+        close(fd);
+        return -1;
+    }
+
+    // Set non-blocking for the RX poll loop
+    int flags = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    return fd;
+}
+
+// Set up the virtio-net device (MMIO transport + config space).
+// Call during boot to register the device on the kernel cmdline.
+// TAP fd is NOT opened here -- call connect_tap() separately for restore/clone.
+bool Vmm::setup_virtio_net(const uint8_t mac[6], bool add_cmdline) {
+    // Populate config space
+    memcpy(net_config_.mac, mac, 6);
+    net_config_.status = VIRTIO_NET_S_LINK_UP;
+    net_config_.max_vq_pairs = 1;
+    net_config_.mtu = 1500;
+
+    if (add_cmdline) {
+        char mmio_param[128];
+        snprintf(mmio_param, sizeof(mmio_param),
+                 " virtio_mmio.device=0x%lx@0x%llx:%u",
+                 VIRTIO_NET_MMIO_SIZE,
+                 (unsigned long long)VIRTIO_NET_MMIO_GPA,
+                 VIRTIO_NET_MMIO_IRQ);
+        strncat(cmdline_, mmio_param, sizeof(cmdline_) - strlen(cmdline_) - 1);
+    }
+
+    printf("[VMM] virtio-net: mac=%02x:%02x:%02x:%02x:%02x:%02x%s\n",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+           add_cmdline ? " (cmdline)" : " (restore)");
+    return true;
+}
+
+// Open a TAP device and connect it to the virtio-net backend.
+// Call on restore/clone when network is needed.
+bool Vmm::connect_tap(const char *tap_name) {
+    tap_fd_ = open_tap(tap_name);
+    if (tap_fd_ < 0) return false;
+    printf("[VMM] TAP connected: %s\n", tap_name);
+    return true;
+}
+
+// MMIO read for the virtio-net device
+void Vmm::net_mmio_read(uint64_t off, uint8_t *data, uint32_t len) {
+    uint32_t val = 0;
+
+    switch (off) {
+    case VIRTIO_MMIO_MAGIC_VALUE:  val = 0x74726976; break; // "virt"
+    case VIRTIO_MMIO_VERSION:      val = 2;          break;
+    case VIRTIO_MMIO_DEVICE_ID:    val = VIRTIO_DEV_NET; break;
+    case VIRTIO_MMIO_VENDOR_ID:    val = VIRTIO_VENDOR_ID; break;
+
+    case VIRTIO_MMIO_DEVICE_FEATURES: {
+        // Don't advertise VIRTIO_NET_F_STATUS: the driver will assume link is always up,
+        // which avoids NO-CARRIER issues after snapshot/restore.
+        uint64_t feat = VIRTIO_NET_F_MAC | VIRT_F_VERSION_1;
+        if (net_features_sel_ == 0) val = (uint32_t)(feat & 0xFFFFFFFF);
+        else if (net_features_sel_ == 1) val = (uint32_t)(feat >> 32);
+        break;
+    }
+    case VIRTIO_MMIO_QUEUE_NUM_MAX: val = 256; break;
+    case VIRTIO_MMIO_QUEUE_READY:
+        if (net_queue_sel_ < NET_NUM_QUEUES) val = net_vqs_[net_queue_sel_].ready;
+        break;
+    case VIRTIO_MMIO_INTERRUPT_STATUS: val = net_irq_status_; break;
+    case VIRTIO_MMIO_STATUS:       val = net_status_;  break;
+    case VIRTIO_MMIO_CONFIG_GEN:   val = 0;           break;
+    case VIRTIO_MMIO_SHM_LEN_LOW:
+    case VIRTIO_MMIO_SHM_LEN_HIGH:
+    case VIRTIO_MMIO_SHM_BASE_LOW:
+    case VIRTIO_MMIO_SHM_BASE_HIGH: val = 0xFFFFFFFF; break;
+    default:
+        // Config space reads
+        if (off >= VIRTIO_MMIO_CONFIG &&
+            off < VIRTIO_MMIO_CONFIG + sizeof(net_config_)) {
+            uint32_t cfg_off = off - VIRTIO_MMIO_CONFIG;
+            memcpy(&val, (uint8_t *)&net_config_ + cfg_off, (len < 4) ? len : 4);
+        }
+        break;
+    }
+    memcpy(data, &val, (len < 4) ? len : 4);
+}
+
+// MMIO write for the virtio-net device
+void Vmm::net_mmio_write(uint64_t off, const uint8_t *data, uint32_t len) {
+    uint32_t val = 0;
+    memcpy(&val, data, (len < 4) ? len : 4);
+
+    switch (off) {
+    case VIRTIO_MMIO_DEVICE_FEATURES_SEL: net_features_sel_ = val; break;
+    case VIRTIO_MMIO_DRIVER_FEATURES_SEL: net_drv_features_sel_ = val; break;
+    case VIRTIO_MMIO_DRIVER_FEATURES:
+        if (net_drv_features_sel_ == 0)
+            net_drv_features_ = (net_drv_features_ & 0xFFFFFFFF00000000ULL) | val;
+        else if (net_drv_features_sel_ == 1)
+            net_drv_features_ = (net_drv_features_ & 0xFFFFFFFFULL) | ((uint64_t)val << 32);
+        break;
+    case VIRTIO_MMIO_QUEUE_SEL: net_queue_sel_ = val; break;
+    case VIRTIO_MMIO_QUEUE_NUM:
+        if (net_queue_sel_ < NET_NUM_QUEUES) net_vqs_[net_queue_sel_].num = val;
+        break;
+    case VIRTIO_MMIO_QUEUE_READY:
+        if (net_queue_sel_ < NET_NUM_QUEUES) net_vqs_[net_queue_sel_].ready = val;
+        break;
+    case VIRTIO_MMIO_QUEUE_NOTIFY:
+        // Wake up the net thread to process queues
+        if (net_active_ && net_wakeup_fd_ >= 0) {
+            uint64_t one = 1;
+            ::write(net_wakeup_fd_, &one, sizeof(one));
+        }
+        break;
+    case VIRTIO_MMIO_INTERRUPT_ACK:
+        net_irq_status_ &= ~val;
+        if (net_irq_status_ == 0) {
+            struct kvm_irq_level irq = {};
+            irq.irq = VIRTIO_NET_MMIO_IRQ;
+            irq.level = 0;
+            ioctl(vm_fd_, KVM_IRQ_LINE, &irq);
+        }
+        break;
+    case VIRTIO_MMIO_STATUS: {
+        uint32_t old = net_status_;
+        net_status_ = val;
+        if (val == 0) {
+            for (auto &q : net_vqs_) q = {};
+            net_drv_features_ = 0;
+            net_irq_status_ = 0;
+        }
+        // DRIVER_OK -> set up vhost-net kernel backend
+        if ((val & 0x4) && !(old & 0x4)) {
+            net_active_ = true;
+            vhost_net_setup();
+        }
+        break;
+    }
+    case VIRTIO_MMIO_QUEUE_DESC_LOW:
+        if (net_queue_sel_ < NET_NUM_QUEUES)
+            net_vqs_[net_queue_sel_].desc = (net_vqs_[net_queue_sel_].desc & ~0xFFFFFFFFULL) | val;
+        break;
+    case VIRTIO_MMIO_QUEUE_DESC_HIGH:
+        if (net_queue_sel_ < NET_NUM_QUEUES)
+            net_vqs_[net_queue_sel_].desc = (net_vqs_[net_queue_sel_].desc & 0xFFFFFFFFULL)
+                                          | ((uint64_t)val << 32);
+        break;
+    case VIRTIO_MMIO_QUEUE_DRIVER_LOW:
+        if (net_queue_sel_ < NET_NUM_QUEUES)
+            net_vqs_[net_queue_sel_].driver = (net_vqs_[net_queue_sel_].driver & ~0xFFFFFFFFULL) | val;
+        break;
+    case VIRTIO_MMIO_QUEUE_DRIVER_HIGH:
+        if (net_queue_sel_ < NET_NUM_QUEUES)
+            net_vqs_[net_queue_sel_].driver = (net_vqs_[net_queue_sel_].driver & 0xFFFFFFFFULL)
+                                            | ((uint64_t)val << 32);
+        break;
+    case VIRTIO_MMIO_QUEUE_DEVICE_LOW:
+        if (net_queue_sel_ < NET_NUM_QUEUES)
+            net_vqs_[net_queue_sel_].device = (net_vqs_[net_queue_sel_].device & ~0xFFFFFFFFULL) | val;
+        break;
+    case VIRTIO_MMIO_QUEUE_DEVICE_HIGH:
+        if (net_queue_sel_ < NET_NUM_QUEUES)
+            net_vqs_[net_queue_sel_].device = (net_vqs_[net_queue_sel_].device & 0xFFFFFFFFULL)
+                                            | ((uint64_t)val << 32);
+        break;
+    default: break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Userspace virtio-net data path (Firecracker model).
+// We process the virtqueues ourselves: TAP -> RX queue, TX queue -> TAP.
+// A dedicated thread polls the TAP for incoming packets and the TX queue
+// for outgoing packets.
+// ---------------------------------------------------------------------------
+
+// VringDesc, VringAvail, VringUsedElem, VringUsed already defined above.
+// Forward declaration for net thread
+void *net_thread_func(void *arg);
+
+bool Vmm::vhost_net_setup() {
+    if (tap_fd_ < 0) return true;  // no TAP -- nothing to do
+
+    // Create net thread wakeup eventfd
+    net_wakeup_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+    // Start the network processing thread
+    pthread_t net_thread;
+    pthread_create(&net_thread, nullptr, net_thread_func, this);
+    pthread_detach(net_thread);
+
+    printf("[VMM] virtio-net: userspace data path active\n");
+    return true;
+}
+
+void *net_thread_func(void *arg) {
+    auto *vmm = (Vmm *)arg;
+
+    // Access the queues via the VMM's ram pointer
+    auto gpa_to_hva = [&](uint64_t gpa) -> void * {
+        if (gpa < vmm->ram_bytes_)
+            return (uint8_t *)vmm->ram_ + gpa;
+        return nullptr;
+    };
+
+    auto &rxq = vmm->net_vqs_[0]; // RX: host -> guest
+    auto &txq = vmm->net_vqs_[1]; // TX: guest -> host
+
+    uint16_t rx_last_used = 0;
+    uint16_t tx_last_avail = 0;
+
+    // Wait until the queues are ready
+    while (!vmm->net_active_ || !rxq.ready || !txq.ready) {
+        usleep(10000); // 10ms
+        if (vmm->tap_fd_ < 0) return nullptr;
+    }
+
+    // Read initial indices from the rings
+    auto *rx_avail = (VringAvail *)gpa_to_hva(rxq.driver);
+    auto *rx_used  = (VringUsed *)gpa_to_hva(rxq.device);
+    auto *rx_desc  = (VringDesc *)gpa_to_hva(rxq.desc);
+    auto *tx_avail = (VringAvail *)gpa_to_hva(txq.driver);
+    auto *tx_used  = (VringUsed *)gpa_to_hva(txq.device);
+    auto *tx_desc  = (VringDesc *)gpa_to_hva(txq.desc);
+
+    if (!rx_avail || !rx_used || !rx_desc || !tx_avail || !tx_used || !tx_desc) {
+        fprintf(stderr, "[VMM] net_thread: invalid queue addresses\n");
+        return nullptr;
+    }
+
+    // Sync: start from where the driver is
+    tx_last_avail = tx_used->idx;
+    rx_last_used = rx_used->idx;
+
+    uint8_t pkt_buf[65536];
+    struct pollfd pfds[2];
+    pfds[0].fd = vmm->tap_fd_;
+    pfds[0].events = POLLIN;
+    pfds[1].fd = vmm->net_wakeup_fd_;
+    pfds[1].events = POLLIN;
+
+    while (!vmm->net_thread_stop_ && vmm->tap_fd_ >= 0) {
+        bool did_work = false;
+
+        // ---- TX: process guest -> host packets ----
+        __sync_synchronize(); // rmb
+        while (tx_last_avail != tx_avail->idx) {
+            uint16_t desc_idx = tx_avail->ring[tx_last_avail % txq.num];
+            // Gather all buffers in the descriptor chain
+            uint8_t *out = pkt_buf;
+            size_t total = 0;
+            uint16_t cur = desc_idx;
+            for (int chain = 0; chain < 64; chain++) {
+                auto *d = &tx_desc[cur % txq.num];
+                void *buf = gpa_to_hva(d->addr);
+                if (buf && d->len > 0 && total + d->len < sizeof(pkt_buf)) {
+                    memcpy(out + total, buf, d->len);
+                    total += d->len;
+                }
+                if (!(d->flags & VRING_DESC_F_NEXT)) break;
+                cur = d->next;
+            }
+
+            // Write to TAP (skip the virtio_net_hdr at the start)
+            if (total > sizeof(VirtioNetHdr)) {
+                uint8_t *eth = pkt_buf + sizeof(VirtioNetHdr);
+                size_t eth_len = total - sizeof(VirtioNetHdr);
+                ssize_t nw = ::write(vmm->tap_fd_, eth, eth_len);
+                (void)nw;
+            }
+
+            // Mark used
+            auto *ue = &tx_used->ring[tx_used->idx % txq.num];
+            ue->id = desc_idx;
+            ue->len = 0;
+            __sync_synchronize(); // wmb
+            tx_used->idx++;
+            tx_last_avail++;
+            did_work = true;
+        }
+
+        // Inject TX completion interrupt (edge-trigger: deassert then assert)
+        if (did_work) {
+            vmm->net_irq_status_ |= 1;
+            struct kvm_irq_level irq = {};
+            irq.irq = VIRTIO_NET_MMIO_IRQ;
+            irq.level = 0;
+            ioctl(vmm->vm_fd_, KVM_IRQ_LINE, &irq);
+            irq.level = 1;
+            ioctl(vmm->vm_fd_, KVM_IRQ_LINE, &irq);
+        }
+
+        // ---- RX: drain all available packets from TAP into guest ----
+        {
+            bool rx_did_work = false;
+            __sync_synchronize();
+            while (rx_last_used != rx_avail->idx) {
+                ssize_t nr = ::read(vmm->tap_fd_, pkt_buf, sizeof(pkt_buf));
+                if (nr <= 0) break; // no more packets
+
+                uint16_t desc_idx = rx_avail->ring[rx_last_used % rxq.num];
+                auto *d = &rx_desc[desc_idx % rxq.num];
+
+                void *buf = gpa_to_hva(d->addr);
+                if (!buf || !(d->flags & VRING_DESC_F_WRITE)) break;
+
+                size_t total = 0;
+                if (d->len >= sizeof(VirtioNetHdr) + (size_t)nr) {
+                    memset(buf, 0, sizeof(VirtioNetHdr));
+                    memcpy((uint8_t *)buf + sizeof(VirtioNetHdr), pkt_buf, nr);
+                    total = sizeof(VirtioNetHdr) + nr;
+                } else if (d->flags & VRING_DESC_F_NEXT) {
+                    size_t hdr_len = std::min((uint32_t)sizeof(VirtioNetHdr), d->len);
+                    memset(buf, 0, hdr_len);
+                    auto *d2 = &rx_desc[d->next % rxq.num];
+                    void *buf2 = gpa_to_hva(d2->addr);
+                    if (buf2 && d2->len >= (uint32_t)nr) {
+                        memcpy(buf2, pkt_buf, nr);
+                        total = sizeof(VirtioNetHdr) + nr;
+                    }
+                }
+
+                if (total > 0) {
+                    auto *ue = &rx_used->ring[rx_used->idx % rxq.num];
+                    ue->id = desc_idx;
+                    ue->len = (uint32_t)total;
+                    __sync_synchronize();
+                    rx_used->idx++;
+                    rx_last_used++;
+                    rx_did_work = true;
+                } else {
+                    break;
+                }
+            }
+            if (rx_did_work) {
+                vmm->net_irq_status_ |= 1;
+                struct kvm_irq_level irq = {};
+                irq.irq = VIRTIO_NET_MMIO_IRQ;
+                irq.level = 0;
+                ioctl(vmm->vm_fd_, KVM_IRQ_LINE, &irq);
+                irq.level = 1;
+                ioctl(vmm->vm_fd_, KVM_IRQ_LINE, &irq);
+                did_work = true;
+            }
+        }
+
+        if (!did_work) {
+            poll(pfds, 2, 10); // 10ms timeout
+            if (pfds[1].revents & POLLIN) {
+                uint64_t v;
+                ::read(vmm->net_wakeup_fd_, &v, 8);
+            }
+        }
+    }
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,7 +1816,7 @@ int Vmm::run() {
                 break;
             }
 
-            // Virtio MMIO region
+            // Virtio-fs MMIO region
             if (addr >= VIRTIO_MMIO_GPA &&
                 addr < VIRTIO_MMIO_GPA + VIRTIO_MMIO_SIZE) {
                 uint64_t off = addr - VIRTIO_MMIO_GPA;
@@ -1284,6 +1824,17 @@ int Vmm::run() {
                     virtio_mmio_write(off, kvm_run_->mmio.data, len);
                 else
                     virtio_mmio_read(off, kvm_run_->mmio.data, len);
+                break;
+            }
+
+            // Virtio-net MMIO region
+            if (addr >= VIRTIO_NET_MMIO_GPA &&
+                addr < VIRTIO_NET_MMIO_GPA + VIRTIO_NET_MMIO_SIZE) {
+                uint64_t off = addr - VIRTIO_NET_MMIO_GPA;
+                if (kvm_run_->mmio.is_write)
+                    net_mmio_write(off, kvm_run_->mmio.data, len);
+                else
+                    net_mmio_read(off, kvm_run_->mmio.data, len);
                 break;
             }
 
@@ -1370,6 +1921,20 @@ bool Vmm::save_snapshot(Snapshot &snap) {
         h.vq_state[i].driver = vqs_[i].driver;
         h.vq_state[i].device = vqs_[i].device;
     }
+
+    // Virtio-net device state
+    h.net_status = net_status_;
+    h.net_drv_features_lo = (uint32_t)(net_drv_features_ & 0xFFFFFFFF);
+    h.net_drv_features_hi = (uint32_t)(net_drv_features_ >> 32);
+    h.net_num_vqs = NET_NUM_QUEUES;
+    for (int i = 0; i < NET_NUM_QUEUES; i++) {
+        h.net_vq_state[i].num    = net_vqs_[i].num;
+        h.net_vq_state[i].ready  = net_vqs_[i].ready;
+        h.net_vq_state[i].desc   = net_vqs_[i].desc;
+        h.net_vq_state[i].driver = net_vqs_[i].driver;
+        h.net_vq_state[i].device = net_vqs_[i].device;
+    }
+    memcpy(h.net_mac, net_config_.mac, 6);
 
     // XSAVE
     memset(snap.xsave, 0, XSAVE_SIZE);
@@ -1467,10 +2032,28 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
         vqs_[i].device = h.vq_state[i].device;
     }
 
+    // Restore virtio-net device state
+    net_status_ = h.net_status;
+    net_drv_features_ = (uint64_t)h.net_drv_features_lo |
+                        ((uint64_t)h.net_drv_features_hi << 32);
+    for (uint32_t i = 0; i < NET_NUM_QUEUES && i < h.net_num_vqs; i++) {
+        net_vqs_[i].num    = h.net_vq_state[i].num;
+        net_vqs_[i].ready  = h.net_vq_state[i].ready;
+        net_vqs_[i].desc   = h.net_vq_state[i].desc;
+        net_vqs_[i].driver = h.net_vq_state[i].driver;
+        net_vqs_[i].device = h.net_vq_state[i].device;
+    }
+
     // If virtiofsd is connected, set up the virtqueues with the new instance
     if (vu_sock_ >= 0 && vdev_status_ & 0x4) {
         virtio_active_ = false; // Reset so vu_setup() runs
         vu_setup();
+    }
+
+    // If TAP is connected and net was active, start the net thread
+    if (tap_fd_ >= 0 && net_status_ & 0x4) {
+        net_active_ = true;
+        vhost_net_setup();
     }
 
     ignore_next_signal_ = true;
@@ -1550,7 +2133,22 @@ bool Vmm::restore_snapshot_file(const char *path) {
 // ---------------------------------------------------------------------------
 
 void Vmm::cleanup() {
-    // Stop IRQ thread first
+    // Signal net thread to stop and give it time to exit
+    net_thread_stop_ = true;
+    if (net_wakeup_fd_ >= 0) {
+        uint64_t one = 1;
+        ::write(net_wakeup_fd_, &one, sizeof(one));
+        usleep(50000); // 50ms for thread to notice
+        close(net_wakeup_fd_);
+    }
+    if (vhost_fd_ >= 0) close(vhost_fd_);
+    if (tap_fd_ >= 0) close(tap_fd_);
+    for (auto &q : net_vqs_) {
+        if (q.kick_fd >= 0) close(q.kick_fd);
+        if (q.call_fd >= 0) close(q.call_fd);
+    }
+
+    // Stop IRQ thread
     if (irq_thread_running_.load()) {
         irq_thread_running_.store(false);
         if (irq_wakeup_fd_ >= 0) {
@@ -1584,6 +2182,8 @@ void Vmm::cleanup() {
     vcpu_fd_ = vm_fd_ = kvm_fd_ = -1;
     ram_ = nullptr;
     ram_memfd_ = -1;
+    tap_fd_ = -1;
+    vhost_fd_ = -1;
     vu_sock_ = vu_backend_sock_ = -1;
     cpuid_ = nullptr;
     virtiofsd_pid_ = -1;
@@ -1597,27 +2197,212 @@ static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s boot   <bzImage> <initrd> --share <dir> [--snapshot <path>]\n"
-        "  %s restore <snapshot> --share <dir> [--entrypoint <cmd>]\n"
-        "  %s clone   <snapshot> <count> --share <dir> [--entrypoint <cmd>]\n",
+        "  %s restore <snapshot> [--share <dir>] --config <json-file>\n"
+        "  %s clone   <snapshot> <count> [--share <dir>] --config <json-file>\n"
+        "\n"
+        "Config JSON format:\n"
+        "  {\n"
+        "    \"rootfs\": \"/path/to/shared/dir\",\n"
+        "    \"entrypoint\": \"/bin/sh\",\n"
+        "    \"hostname\": \"myvm\",\n"
+        "    \"env\": { \"KEY\": \"VAL\" },\n"
+        "    \"net\": {\n"
+        "      \"tap\": \"tap0\",\n"
+        "      \"ip\": \"10.0.0.2/24\",\n"
+        "      \"gateway\": \"10.0.0.1\",\n"
+        "      \"mac\": \"52:54:00:12:34:56\"\n"
+        "    }\n"
+        "  }\n",
         prog, prog, prog);
-}
-
-static void write_entrypoint_file(const char *share_dir, const char *entrypoint) {
-    if (!share_dir || !entrypoint) return;
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/.entrypoint", share_dir);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        write(fd, entrypoint, strlen(entrypoint));
-        write(fd, "\n", 1);
-        close(fd);
-    }
 }
 
 static const char *find_arg(int argc, char **argv, const char *flag) {
     for (int i = 1; i < argc - 1; i++)
         if (strcmp(argv[i], flag) == 0) return argv[i + 1];
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal JSON config parser (no dependencies)
+// Parses our specific config format -- not a general JSON parser.
+// ---------------------------------------------------------------------------
+
+struct VmConfig {
+    char rootfs[PATH_MAX] = {};
+    char entrypoint[256]  = {};
+    char hostname[64]     = {};
+    char tap[IFNAMSIZ]    = {};
+    char ip[32]           = {};
+    char gateway[32]      = {};
+    uint8_t mac[6]        = {};
+    bool has_net          = false;
+    // env vars: up to 32
+    struct { char key[64]; char val[256]; } env[32];
+    int num_env = 0;
+};
+
+// Skip whitespace in JSON string
+static const char *skip_ws(const char *p) {
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    return p;
+}
+
+// Extract a quoted string value, return pointer past closing quote
+static const char *parse_string(const char *p, char *out, size_t maxlen) {
+    p = skip_ws(p);
+    if (*p != '"') return nullptr;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i < maxlen - 1) {
+        if (*p == '\\' && *(p+1)) { p++; } // simple escape
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+    if (*p == '"') p++;
+    return p;
+}
+
+// Parse MAC address "xx:xx:xx:xx:xx:xx"
+static bool parse_mac(const char *s, uint8_t mac[6]) {
+    unsigned int m[6];
+    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &m[0],&m[1],&m[2],&m[3],&m[4],&m[5]) != 6)
+        return false;
+    for (int i = 0; i < 6; i++) mac[i] = (uint8_t)m[i];
+    return true;
+}
+
+static bool parse_config(const char *path, VmConfig &cfg) {
+    FILE *f = fopen(path, "r");
+    if (!f) { perror("open config"); return false; }
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    // Simple key-value extraction from JSON
+    // Look for top-level keys
+    auto find_val = [&](const char *key, char *out, size_t maxlen) -> bool {
+        char needle[128];
+        snprintf(needle, sizeof(needle), "\"%s\"", key);
+        const char *p = strstr(buf, needle);
+        if (!p) return false;
+        p += strlen(needle);
+        p = skip_ws(p);
+        if (*p != ':') return false;
+        p = skip_ws(p + 1);
+        parse_string(p, out, maxlen);
+        return out[0] != '\0';
+    };
+
+    find_val("rootfs", cfg.rootfs, sizeof(cfg.rootfs));
+    find_val("entrypoint", cfg.entrypoint, sizeof(cfg.entrypoint));
+    find_val("hostname", cfg.hostname, sizeof(cfg.hostname));
+
+    // Parse net object
+    const char *net = strstr(buf, "\"net\"");
+    if (net) {
+        // Find the { after "net":
+        const char *p = net + 5;
+        p = skip_ws(p);
+        if (*p == ':') p = skip_ws(p + 1);
+        if (*p == '{') {
+            cfg.has_net = true;
+            char mac_str[32] = {};
+            // Parse within the net block -- find closing }
+            const char *end = strchr(p, '}');
+            if (!end) end = buf + n;
+            size_t block_len = end - p + 1;
+            char net_block[2048];
+            if (block_len < sizeof(net_block)) {
+                memcpy(net_block, p, block_len);
+                net_block[block_len] = '\0';
+                // Extract fields from net block
+                auto find_net_val = [&](const char *key, char *out, size_t maxlen) {
+                    char needle2[128];
+                    snprintf(needle2, sizeof(needle2), "\"%s\"", key);
+                    const char *pp = strstr(net_block, needle2);
+                    if (!pp) return;
+                    pp += strlen(needle2);
+                    pp = skip_ws(pp);
+                    if (*pp == ':') pp = skip_ws(pp + 1);
+                    parse_string(pp, out, maxlen);
+                };
+                find_net_val("tap", cfg.tap, sizeof(cfg.tap));
+                find_net_val("ip", cfg.ip, sizeof(cfg.ip));
+                find_net_val("gateway", cfg.gateway, sizeof(cfg.gateway));
+                find_net_val("mac", mac_str, sizeof(mac_str));
+                if (mac_str[0]) parse_mac(mac_str, cfg.mac);
+            }
+        }
+    }
+
+    // Parse env object (simple flat key-value)
+    const char *env = strstr(buf, "\"env\"");
+    if (env) {
+        const char *p = env + 5;
+        p = skip_ws(p);
+        if (*p == ':') p = skip_ws(p + 1);
+        if (*p == '{') {
+            p++;
+            while (*p && *p != '}' && cfg.num_env < 32) {
+                p = skip_ws(p);
+                if (*p == '"') {
+                    char key[64] = {}, val[256] = {};
+                    p = parse_string(p, key, sizeof(key));
+                    if (!p) break;
+                    p = skip_ws(p);
+                    if (*p == ':') p = skip_ws(p + 1);
+                    p = parse_string(p, val, sizeof(val));
+                    if (!p) break;
+                    strncpy(cfg.env[cfg.num_env].key, key, 63);
+                    strncpy(cfg.env[cfg.num_env].val, val, 255);
+                    cfg.num_env++;
+                    p = skip_ws(p);
+                    if (*p == ',') p++;
+                } else {
+                    p++;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+// Write the config to the shared directory so the guest init can read it
+static void write_config_to_share(const char *share_dir, const VmConfig &cfg) {
+    if (!share_dir) return;
+
+    // Write .entrypoint
+    if (cfg.entrypoint[0]) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/.entrypoint", share_dir);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            ::write(fd, cfg.entrypoint, strlen(cfg.entrypoint));
+            ::write(fd, "\n", 1);
+            close(fd);
+        }
+    }
+
+    // Write .vmconfig (simple key=value format the init script can source)
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.vmconfig", share_dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    if (cfg.hostname[0])
+        fprintf(f, "HOSTNAME=%s\n", cfg.hostname);
+    if (cfg.ip[0])
+        fprintf(f, "NET_IP=%s\n", cfg.ip);
+    if (cfg.gateway[0])
+        fprintf(f, "NET_GW=%s\n", cfg.gateway);
+    if (cfg.has_net)
+        fprintf(f, "NET_MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                cfg.mac[0], cfg.mac[1], cfg.mac[2],
+                cfg.mac[3], cfg.mac[4], cfg.mac[5]);
+    for (int i = 0; i < cfg.num_env; i++)
+        fprintf(f, "ENV_%s=%s\n", cfg.env[i].key, cfg.env[i].val);
+    fclose(f);
 }
 
 int main(int argc, char **argv) {
@@ -1642,6 +2427,16 @@ int main(int argc, char **argv) {
         if (share_dir) {
             if (!vmm.start_virtiofsd(share_dir)) return 1;
         }
+
+        // Always register virtio-fs MMIO region on boot so the kernel
+        // probes the device.  No virtiofsd running yet -- mount will
+        // fail during boot, but restore/clone will start virtiofsd.
+        vmm.setup_virtio_fs(true);
+
+        // Always register virtio-net on boot so the kernel probes it.
+        // No TAP connected yet -- packets go nowhere until restore/clone.
+        uint8_t boot_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+        vmm.setup_virtio_net(boot_mac, true);
 
         if (!vmm.setup_bios() || !vmm.load_bzimage(kernel) ||
             !vmm.load_initrd(initrd) || !vmm.setup_cpu())
@@ -1668,11 +2463,27 @@ int main(int argc, char **argv) {
     // ── restore ──
     if (strcmp(cmd, "restore") == 0) {
         if (argc < 3) { usage(argv[0]); return 1; }
-        const char *snap_path  = argv[2];
-        const char *share_dir  = find_arg(argc, argv, "--share");
-        const char *entrypoint = find_arg(argc, argv, "--entrypoint");
+        const char *snap_path   = argv[2];
+        const char *share_dir   = find_arg(argc, argv, "--share");
+        const char *config_path = find_arg(argc, argv, "--config");
+        // Legacy support
+        const char *entrypoint  = find_arg(argc, argv, "--entrypoint");
 
-        write_entrypoint_file(share_dir, entrypoint);
+        VmConfig cfg = {};
+        if (config_path) {
+            if (!parse_config(config_path, cfg)) return 1;
+        } else if (entrypoint) {
+            strncpy(cfg.entrypoint, entrypoint, sizeof(cfg.entrypoint) - 1);
+        }
+
+        // Config rootfs overrides --share if not explicitly given
+        if (!share_dir && cfg.rootfs[0])
+            share_dir = cfg.rootfs;
+
+        write_config_to_share(share_dir, cfg);
+
+        struct timespec t0, t1, t2;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
 
         Vmm vmm(64);
         if (!vmm.init()) return 1;
@@ -1682,20 +2493,52 @@ int main(int argc, char **argv) {
             vmm.setup_virtio_fs();
         }
 
+        // Restore the virtio-net device state (no cmdline -- already in snapshot)
+        uint8_t restore_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+        if (cfg.has_net && cfg.mac[0])
+            memcpy(restore_mac, cfg.mac, 6);
+        vmm.setup_virtio_net(restore_mac, false);
+
+        if (cfg.has_net && cfg.tap[0]) {
+            if (!vmm.connect_tap(cfg.tap)) return 1;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
         if (!vmm.restore_snapshot_file(snap_path)) return 1;
-        printf("[VMM] restored, running...\n");
+
+        clock_gettime(CLOCK_MONOTONIC, &t2);
+        auto ms = [](struct timespec &a, struct timespec &b) -> long {
+            return (b.tv_sec - a.tv_sec) * 1000L +
+                   (b.tv_nsec - a.tv_nsec) / 1000000L;
+        };
+        printf("[VMM] restored in %ldms (setup: %ldms, snap: %ldms), running...\n",
+               ms(t0, t2), ms(t0, t1), ms(t1, t2));
         return (vmm.run() >= 0) ? 0 : 1;
     }
 
     // ── clone ──
     if (strcmp(cmd, "clone") == 0) {
         if (argc < 4) { usage(argv[0]); return 1; }
-        const char *snap_path  = argv[2];
+        const char *snap_path   = argv[2];
         int count = atoi(argv[3]);
-        const char *share_dir  = find_arg(argc, argv, "--share");
-        const char *entrypoint = find_arg(argc, argv, "--entrypoint");
+        const char *share_dir   = find_arg(argc, argv, "--share");
+        const char *config_path = find_arg(argc, argv, "--config");
+        // Legacy support
+        const char *entrypoint  = find_arg(argc, argv, "--entrypoint");
 
-        write_entrypoint_file(share_dir, entrypoint);
+        VmConfig cfg = {};
+        if (config_path) {
+            if (!parse_config(config_path, cfg)) return 1;
+        } else if (entrypoint) {
+            strncpy(cfg.entrypoint, entrypoint, sizeof(cfg.entrypoint) - 1);
+        }
+
+        // Config rootfs overrides --share if not explicitly given
+        if (!share_dir && cfg.rootfs[0])
+            share_dir = cfg.rootfs;
+
+        write_config_to_share(share_dir, cfg);
 
         // Load snapshot into memory once (parent process)
         Snapshot golden;
@@ -1739,6 +2582,36 @@ int main(int argc, char **argv) {
                     if (!vmm.start_virtiofsd(share_dir)) _exit(1);
                     vmm.setup_virtio_fs();
                 }
+
+                // For clone, each clone gets its own TAP + MAC + IP
+                uint8_t clone_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+                if (cfg.has_net) {
+                    memcpy(clone_mac, cfg.mac, 6);
+                    clone_mac[5] = (uint8_t)(cfg.mac[5] + i);
+
+                    char clone_tap[IFNAMSIZ];
+                    snprintf(clone_tap, sizeof(clone_tap), "tap%d", i);
+
+                    // Write per-clone config to shared dir
+                    if (share_dir) {
+                        VmConfig clone_cfg = cfg;
+                        strncpy(clone_cfg.tap, clone_tap, IFNAMSIZ - 1);
+                        memcpy(clone_cfg.mac, clone_mac, 6);
+                        unsigned a,b,c,d,prefix;
+                        if (sscanf(cfg.ip, "%u.%u.%u.%u/%u", &a,&b,&c,&d,&prefix) == 5) {
+                            snprintf(clone_cfg.ip, sizeof(clone_cfg.ip),
+                                     "%u.%u.%u.%u/%u", a, b, c, d + i, prefix);
+                        }
+                        write_config_to_share(share_dir, clone_cfg);
+                    }
+
+                    if (!vmm.connect_tap(clone_tap)) {
+                        fprintf(stderr, "[VMM clone %d] TAP setup failed\n", i);
+                    }
+                }
+
+                // Set up virtio-net device (no cmdline -- already in snapshot)
+                vmm.setup_virtio_net(clone_mac, false);
 
                 if (!vmm.restore_snapshot(golden)) _exit(1);
 

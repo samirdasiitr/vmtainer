@@ -28,6 +28,52 @@ if [ -f /share/.entrypoint ]; then
     ENTRYPOINT=$(head -1 /share/.entrypoint)
 fi
 
+# Read VM config (network, hostname, env vars)
+if [ -f /share/.vmconfig ]; then
+    log "VMTAINER: reading config"
+    . /share/.vmconfig
+fi
+
+# Configure hostname
+if [ -n "$HOSTNAME" ]; then
+    log "VMTAINER: hostname=$HOSTNAME"
+    hostname "$HOSTNAME"
+    echo "$HOSTNAME" > /proc/sys/kernel/hostname
+fi
+
+# Configure networking
+if [ -n "$NET_IP" ]; then
+    log "VMTAINER: configuring network ip=$NET_IP gw=$NET_GW"
+    # List all network interfaces for debugging
+    log "VMTAINER: interfaces: $(ls /sys/class/net/ 2>/dev/null)"
+
+    # Wait for eth0 to appear (virtio-net driver probed during boot)
+    for i in 1 2 3 4 5; do
+        if ip link show eth0 >/dev/null 2>&1; then
+            break
+        fi
+        log "VMTAINER: waiting for eth0 ($i)"
+        sleep 0.2
+    done
+
+    ip link set eth0 up 2>/tmp/net_err
+    if [ $? -ne 0 ]; then
+        log "VMTAINER: eth0 up failed: $(cat /tmp/net_err)"
+    fi
+    ip addr add "$NET_IP" dev eth0 2>/tmp/net_err
+    if [ $? -ne 0 ]; then
+        log "VMTAINER: ip addr failed: $(cat /tmp/net_err)"
+    fi
+    if [ -n "$NET_GW" ]; then
+        ip route add default via "$NET_GW" dev eth0 2>/tmp/net_err
+        if [ $? -ne 0 ]; then
+            log "VMTAINER: route failed: $(cat /tmp/net_err)"
+        fi
+    fi
+    log "VMTAINER: network configured"
+    log "VMTAINER: ip addr: $(ip addr show eth0 2>&1)"
+fi
+
 # If no entrypoint specified, fall back to running init.py (legacy)
 if [ -z "$ENTRYPOINT" ]; then
     log "VMTAINER: no entrypoint, running legacy init.py"
@@ -53,6 +99,14 @@ mount --move /dev  /share/dev  2>/dev/null || mount -t devtmpfs devtmpfs /share/
 
 # Create /dev/kmsg if missing
 [ -e /share/dev/kmsg ] || mknod /share/dev/kmsg c 1 11 2>/dev/null
+
+# Export env vars from config
+for v in $(set | grep '^ENV_' | sed 's/=.*//'); do
+    key=$(echo "$v" | sed 's/^ENV_//')
+    eval "val=\$$v"
+    export "$key=$val"
+    log "VMTAINER: env $key=$val"
+done
 
 # Run the entrypoint inside the chroot as a subprocess.
 # When it finishes, we (init / PID 1) do the halt.
