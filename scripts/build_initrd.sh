@@ -14,7 +14,7 @@ mkdir -p "$INITRD"/{bin,dev,proc,sys,tmp,mnt,etc,share}
 cp /usr/bin/busybox "$INITRD/bin/busybox"
 chmod +x "$INITRD/bin/busybox"
 
-for applet in sh echo cat sleep mkdir mount mountpoint umount pivot_root chroot head mknod halt poweroff reboot dd hostname ls; do
+for applet in sh echo cat sleep mkdir mount mountpoint umount pivot_root chroot head mknod halt poweroff reboot dd hostname ls ip ifconfig route; do
     ln -sf /bin/busybox "$INITRD/bin/$applet"
 done
 
