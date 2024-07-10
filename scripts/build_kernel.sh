@@ -98,6 +98,8 @@ CONFIG_9P_FS_POSIX_ACL=y
 
 # Keep it small
 CONFIG_MODULES=n
+# Unix domain sockets (needed by nginx, many apps)
+CONFIG_UNIX=y
 
 # Power / reset
 CONFIG_ACPI=n
