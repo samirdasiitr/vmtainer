@@ -416,7 +416,7 @@ public:
     ~Vmm() { cleanup(); }
 
     // Setup
-    bool init();
+    bool init(bool zero_ram = true);
     bool setup_bios();
     bool load_bzimage(const char *path);
     bool load_initrd(const char *path);
@@ -2092,39 +2092,56 @@ bool Vmm::restore_snapshot_file(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open snap"); return false; }
 
-    Snapshot snap;
-    if (::read(fd, &snap.hdr, sizeof(snap.hdr)) != sizeof(snap.hdr)) {
-        perror("read hdr"); close(fd); return false;
-    }
-    if (::read(fd, snap.xsave, snap.hdr.xsave_size) != (ssize_t)snap.hdr.xsave_size) {
-        perror("read xsave"); close(fd); return false;
-    }
-
-    snap.cpuid.resize(snap.hdr.cpuid_nent);
-    size_t csz = snap.hdr.cpuid_nent * sizeof(kvm_cpuid_entry2);
-    if (::read(fd, snap.cpuid.data(), csz) != (ssize_t)csz) {
-        perror("read cpuid"); close(fd); return false;
-    }
-
-    snap.msrs.resize(snap.hdr.num_msrs);
-    size_t msz = snap.hdr.num_msrs * sizeof(kvm_msr_entry);
-    if (::read(fd, snap.msrs.data(), msz) != (ssize_t)msz) {
-        perror("read msrs"); close(fd); return false;
-    }
-
-    snap.ram_size = snap.hdr.ram_mb * 1024ULL * 1024;
-    snap.ram = mmap(nullptr, snap.ram_size, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    size_t rd = 0;
-    while (rd < snap.ram_size) {
-        ssize_t n = ::read(fd, (uint8_t *)snap.ram + rd, snap.ram_size - rd);
-        if (n <= 0) { perror("read mem"); close(fd); return false; }
-        rd += n;
-    }
+    // mmap the entire file for zero-copy access to the snapshot
+    struct stat st;
+    if (fstat(fd, &st) < 0) { perror("fstat snap"); close(fd); return false; }
+    void *map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE,
+                     fd, 0);
     close(fd);
+    if (map == MAP_FAILED) { perror("mmap snap"); return false; }
+
+    // Advise sequential access for readahead
+    madvise(map, st.st_size, MADV_SEQUENTIAL);
+
+    const uint8_t *p = (const uint8_t *)map;
+    size_t remain = st.st_size;
+
+    // Parse header
+    Snapshot snap;
+    if (remain < sizeof(snap.hdr)) { munmap(map, st.st_size); return false; }
+    memcpy(&snap.hdr, p, sizeof(snap.hdr));
+    p += sizeof(snap.hdr); remain -= sizeof(snap.hdr);
+
+    // Parse xsave
+    if (remain < snap.hdr.xsave_size) { munmap(map, st.st_size); return false; }
+    memcpy(snap.xsave, p, snap.hdr.xsave_size);
+    p += snap.hdr.xsave_size; remain -= snap.hdr.xsave_size;
+
+    // Parse cpuid
+    size_t csz = snap.hdr.cpuid_nent * sizeof(kvm_cpuid_entry2);
+    if (remain < csz) { munmap(map, st.st_size); return false; }
+    snap.cpuid.resize(snap.hdr.cpuid_nent);
+    memcpy(snap.cpuid.data(), p, csz);
+    p += csz; remain -= csz;
+
+    // Parse msrs
+    size_t msz = snap.hdr.num_msrs * sizeof(kvm_msr_entry);
+    if (remain < msz) { munmap(map, st.st_size); return false; }
+    snap.msrs.resize(snap.hdr.num_msrs);
+    memcpy(snap.msrs.data(), p, msz);
+    p += msz; remain -= msz;
+
+    // RAM: point directly into the mmap (avoid copy)
+    snap.ram_size = snap.hdr.ram_mb * 1024ULL * 1024;
+    if (remain < snap.ram_size) { munmap(map, st.st_size); return false; }
+    snap.ram = (void *)p;
 
     bool ok = restore_snapshot(snap);
-    munmap(snap.ram, snap.ram_size);
+
+    // Don't let ~Snapshot munmap -- we own the mapping
+    snap.ram = nullptr;
+    snap.ram_size = 0;
+    munmap(map, st.st_size);
     return ok;
 }
 
