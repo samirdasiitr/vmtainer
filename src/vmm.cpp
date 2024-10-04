@@ -579,7 +579,7 @@ bool Vmm::query_msr_list() {
     return true;
 }
 
-bool Vmm::init() {
+bool Vmm::init(bool zero_ram) {
     kvm_fd_ = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if (kvm_fd_ < 0) { perror("open /dev/kvm"); return false; }
     if (ioctl(kvm_fd_, KVM_GET_API_VERSION, 0) != 12) {
@@ -2499,15 +2499,24 @@ int main(int argc, char **argv) {
 
         write_config_to_share(share_dir, cfg);
 
-        struct timespec t0, t1, t2;
+        auto us_since = [](struct timespec &base) -> long {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            return (now.tv_sec - base.tv_sec) * 1000000L +
+                   (now.tv_nsec - base.tv_nsec) / 1000L;
+        };
+        struct timespec t0;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
         Vmm vmm(64);
-        if (!vmm.init()) return 1;
+        if (!vmm.init(false)) return 1;  // skip zeroing -- snapshot overwrites RAM
+        long us_init = us_since(t0);
 
+        long us_virtiofsd = 0;
         if (share_dir) {
             if (!vmm.start_virtiofsd(share_dir)) return 1;
             vmm.setup_virtio_fs();
+            us_virtiofsd = us_since(t0) - us_init;
         }
 
         // Restore the virtio-net device state (no cmdline -- already in snapshot)
