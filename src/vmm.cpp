@@ -611,7 +611,7 @@ bool Vmm::init(bool zero_ram) {
     ram_ = mmap(nullptr, ram_bytes_, PROT_READ | PROT_WRITE,
                 MAP_SHARED, ram_memfd_, 0);
     if (ram_ == MAP_FAILED) { perror("mmap ram"); return false; }
-    memset(ram_, 0, ram_bytes_);
+    if (zero_ram) memset(ram_, 0, ram_bytes_);
 
     if (!set_memslot(0, 0, ram_, ram_bytes_)) return false;
 
@@ -2528,18 +2528,17 @@ int main(int argc, char **argv) {
         if (cfg.has_net && cfg.tap[0]) {
             if (!vmm.connect_tap(cfg.tap)) return 1;
         }
-
-        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long us_setup = us_since(t0);
 
         if (!vmm.restore_snapshot_file(snap_path)) return 1;
+        long us_snap = us_since(t0) - us_setup;
 
-        clock_gettime(CLOCK_MONOTONIC, &t2);
-        auto ms = [](struct timespec &a, struct timespec &b) -> long {
-            return (b.tv_sec - a.tv_sec) * 1000L +
-                   (b.tv_nsec - a.tv_nsec) / 1000000L;
-        };
-        printf("[VMM] restored in %ldms (setup: %ldms, snap: %ldms), running...\n",
-               ms(t0, t2), ms(t0, t1), ms(t1, t2));
+        printf("[VMM] restored in %.1fms  kvm_init=%.1fms virtiofsd=%.1fms tap=%.1fms snap=%.1fms\n",
+               us_since(t0) / 1000.0,
+               us_init / 1000.0,
+               us_virtiofsd / 1000.0,
+               (us_setup - us_init - us_virtiofsd) / 1000.0,
+               us_snap / 1000.0);
         return (vmm.run() >= 0) ? 0 : 1;
     }
 
