@@ -1115,11 +1115,12 @@ bool Vmm::vu_connect(const char *sock_path) {
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
-    // Retry connection (virtiofsd may still be starting)
-    for (int i = 0; i < 50; i++) {
+    // Retry connection with fast exponential backoff
+    // virtiofsd typically ready within 10-50ms
+    for (int us = 1000; us <= 200000; us = std::min(us * 2, 200000)) {
         if (connect(vu_sock_, (struct sockaddr *)&addr, sizeof(addr)) == 0)
             return true;
-        usleep(100000); // 100ms
+        usleep(us);
     }
 
     perror("connect to virtiofsd");
@@ -2601,7 +2602,7 @@ int main(int argc, char **argv) {
             if (pid == 0) {
                 // Child: each clone gets its own VM, virtiofsd, etc.
                 Vmm vmm(golden.hdr.ram_mb);
-                if (!vmm.init()) _exit(1);
+                if (!vmm.init(false)) _exit(1);
 
                 if (share_dir) {
                     if (!vmm.start_virtiofsd(share_dir)) _exit(1);
