@@ -330,7 +330,7 @@ struct __attribute__((packed)) VhostUserMsg {
 // ---------------------------------------------------------------------------
 
 #define SNAP_MAGIC   0x48594C54534E4150ULL
-#define SNAP_VERSION 6
+#define SNAP_VERSION 7
 #define MAX_MSRS     256
 #define XSAVE_SIZE   8192
 
@@ -2069,6 +2069,26 @@ bool Vmm::save_snapshot_file(const char *path) {
     Snapshot snap;
     if (!save_snapshot(snap)) return false;
 
+    // Build dirty page bitmap (1 bit per 4K page)
+    constexpr size_t PAGE = 4096;
+    size_t total_pages = ram_bytes_ / PAGE;
+    size_t bm_bytes = (total_pages + 7) / 8;
+    std::vector<uint8_t> bitmap(bm_bytes, 0);
+    const uint8_t *ram = (const uint8_t *)snap.ram;
+    size_t dirty_count = 0;
+    for (size_t pg = 0; pg < total_pages; pg++) {
+        const uint64_t *p = (const uint64_t *)(ram + pg * PAGE);
+        uint64_t acc = 0;
+        for (size_t w = 0; w < PAGE / sizeof(uint64_t); w += 8)
+            acc |= p[w] | p[w+1] | p[w+2] | p[w+3] |
+                   p[w+4] | p[w+5] | p[w+6] | p[w+7];
+        if (acc) { bitmap[pg / 8] |= (1 << (pg & 7)); dirty_count++; }
+    }
+    snap.hdr.bitmap_bytes = bm_bytes;
+
+    printf("[VMM] snapshot: %zu/%zu pages dirty (%.0f%%)\n",
+           dirty_count, total_pages, dirty_count * 100.0 / total_pages);
+
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { perror("open snap"); return false; }
 
@@ -2581,6 +2601,10 @@ int main(int argc, char **argv) {
             golden.msrs.resize(golden.hdr.num_msrs);
             ::read(fd, golden.msrs.data(),
                    golden.hdr.num_msrs * sizeof(kvm_msr_entry));
+            if (golden.hdr.bitmap_bytes > 0) {
+                golden.dirty_bitmap.resize(golden.hdr.bitmap_bytes);
+                ::read(fd, golden.dirty_bitmap.data(), golden.hdr.bitmap_bytes);
+            }
             golden.ram_size = golden.hdr.ram_mb * 1024ULL * 1024;
             golden.ram = mmap(nullptr, golden.ram_size, PROT_READ | PROT_WRITE,
                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
