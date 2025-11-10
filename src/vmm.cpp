@@ -386,10 +386,15 @@ struct SnapshotHeader {
     uint8_t  net_mac[6];
     uint8_t  net_pad[2]; // alignment
 
+    // Dirty page bitmap: 1 bit per 4K page (bitmap_bytes = ram_mb * 256 / 8)
+    uint32_t bitmap_bytes;  // 0 if no bitmap
+    uint32_t bitmap_pad;
+
     // Followed in memory / on disk by:
     //   xsave_buf[xsave_size]
     //   kvm_cpuid_entry2[cpuid_nent]
     //   kvm_msr_entry[num_msrs]
+    //   dirty_bitmap[bitmap_bytes]   (if bitmap_bytes > 0)
     //   guest_ram[ram_mb * 1M]
 };
 
@@ -2096,6 +2101,7 @@ bool Vmm::save_snapshot_file(const char *path) {
     write(fd, snap.xsave, snap.hdr.xsave_size);
     write(fd, snap.cpuid.data(), snap.cpuid.size() * sizeof(kvm_cpuid_entry2));
     write(fd, snap.msrs.data(), snap.msrs.size() * sizeof(kvm_msr_entry));
+    write(fd, bitmap.data(), bm_bytes);
 
     size_t off = 0;
     while (off < ram_bytes_) {
