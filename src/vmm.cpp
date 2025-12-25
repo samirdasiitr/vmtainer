@@ -409,6 +409,7 @@ struct Snapshot {
     std::vector<kvm_msr_entry>    msrs;
     void                   *ram      = nullptr;  // mmap'd RAM copy
     size_t                  ram_size = 0;
+    std::vector<uint8_t>    dirty_bitmap;          // 1 bit per 4K page
 };
 
 // ---------------------------------------------------------------------------
@@ -2122,46 +2123,55 @@ bool Vmm::restore_snapshot_file(const char *path) {
     // mmap the entire file for zero-copy access to the snapshot
     struct stat st;
     if (fstat(fd, &st) < 0) { perror("fstat snap"); close(fd); return false; }
-    void *map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE,
-                     fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) { perror("mmap snap"); return false; }
+    void *map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) { perror("mmap snap"); close(fd); return false; }
 
-    // Advise sequential access for readahead
-    madvise(map, st.st_size, MADV_SEQUENTIAL);
+    // Only readahead the header (first few KB) eagerly.
+    // RAM pages will be faulted in selectively via the dirty bitmap.
+    madvise(map, std::min((size_t)st.st_size, (size_t)(256 * 1024)), MADV_WILLNEED);
 
     const uint8_t *p = (const uint8_t *)map;
     size_t remain = st.st_size;
 
     // Parse header
     Snapshot snap;
-    if (remain < sizeof(snap.hdr)) { munmap(map, st.st_size); return false; }
+    if (remain < sizeof(snap.hdr)) { munmap(map, st.st_size); close(fd); return false; }
     memcpy(&snap.hdr, p, sizeof(snap.hdr));
     p += sizeof(snap.hdr); remain -= sizeof(snap.hdr);
 
     // Parse xsave
-    if (remain < snap.hdr.xsave_size) { munmap(map, st.st_size); return false; }
+    if (remain < snap.hdr.xsave_size) { munmap(map, st.st_size); close(fd); return false; }
     memcpy(snap.xsave, p, snap.hdr.xsave_size);
     p += snap.hdr.xsave_size; remain -= snap.hdr.xsave_size;
 
     // Parse cpuid
     size_t csz = snap.hdr.cpuid_nent * sizeof(kvm_cpuid_entry2);
-    if (remain < csz) { munmap(map, st.st_size); return false; }
+    if (remain < csz) { munmap(map, st.st_size); close(fd); return false; }
     snap.cpuid.resize(snap.hdr.cpuid_nent);
     memcpy(snap.cpuid.data(), p, csz);
     p += csz; remain -= csz;
 
     // Parse msrs
     size_t msz = snap.hdr.num_msrs * sizeof(kvm_msr_entry);
-    if (remain < msz) { munmap(map, st.st_size); return false; }
+    if (remain < msz) { munmap(map, st.st_size); close(fd); return false; }
     snap.msrs.resize(snap.hdr.num_msrs);
     memcpy(snap.msrs.data(), p, msz);
     p += msz; remain -= msz;
 
+    // Parse dirty bitmap (if present)
+    if (snap.hdr.bitmap_bytes > 0) {
+        if (remain < snap.hdr.bitmap_bytes) { munmap(map, st.st_size); close(fd); return false; }
+        snap.dirty_bitmap.resize(snap.hdr.bitmap_bytes);
+        memcpy(snap.dirty_bitmap.data(), p, snap.hdr.bitmap_bytes);
+        p += snap.hdr.bitmap_bytes; remain -= snap.hdr.bitmap_bytes;
+    }
+
     // RAM: point directly into the mmap (avoid copy)
     snap.ram_size = snap.hdr.ram_mb * 1024ULL * 1024;
-    if (remain < snap.ram_size) { munmap(map, st.st_size); return false; }
+    if (remain < snap.ram_size) { munmap(map, st.st_size); close(fd); return false; }
     snap.ram = (void *)p;
+    // Don't readahead RAM pages -- bitmap-guided copy will be selective
+    madvise((void *)p, snap.ram_size, MADV_RANDOM);
 
     bool ok = restore_snapshot(snap);
 
