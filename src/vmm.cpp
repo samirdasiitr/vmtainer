@@ -1987,8 +1987,34 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
         return false;
     }
 
-    // Restore guest RAM
-    memcpy(ram_, snap.ram, ram_bytes_);
+    // Restore guest RAM -- sparse copy (skip zero pages).
+    // The memfd starts zeroed, so we only copy non-zero (dirty) pages.
+    // With a dirty bitmap we skip zero pages entirely (no reads).
+    // Without one, we scan each page with a fast OR-reduce.
+    {
+        constexpr size_t PAGE = 4096;
+        const uint8_t *src = (const uint8_t *)snap.ram;
+        uint8_t *dst = (uint8_t *)ram_;
+        size_t total_pages = ram_bytes_ / PAGE;
+
+        if (!snap.dirty_bitmap.empty()) {
+            // Fast path: bitmap-guided copy (no reads of zero pages)
+            for (size_t pg = 0; pg < total_pages; pg++) {
+                if (snap.dirty_bitmap[pg / 8] & (1 << (pg & 7)))
+                    memcpy(dst + pg * PAGE, src + pg * PAGE, PAGE);
+            }
+        } else {
+            // Slow path: scan each page
+            for (size_t off = 0; off < ram_bytes_; off += PAGE) {
+                const uint64_t *p = (const uint64_t *)(src + off);
+                uint64_t acc = 0;
+                for (size_t w = 0; w < PAGE / sizeof(uint64_t); w += 8)
+                    acc |= p[w] | p[w+1] | p[w+2] | p[w+3] |
+                           p[w+4] | p[w+5] | p[w+6] | p[w+7];
+                if (acc) memcpy(dst + off, src + off, PAGE);
+            }
+        }
+    }
 
     // Restore CPUID
     size_t csz = sizeof(kvm_cpuid2) + h.cpuid_nent * sizeof(kvm_cpuid_entry2);
@@ -2179,6 +2205,7 @@ bool Vmm::restore_snapshot_file(const char *path) {
     snap.ram = nullptr;
     snap.ram_size = 0;
     munmap(map, st.st_size);
+    close(fd);
     return ok;
 }
 
