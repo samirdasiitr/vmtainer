@@ -23,3 +23,17 @@ test_rootfs/
 *~
 .vscode/
 .idea/
+
+# Kernel module build artifacts
+kmod/*.ko
+kmod/*.o
+kmod/*.mod
+kmod/*.mod.c
+kmod/*.mod.o
+kmod/.*.cmd
+kmod/Module.symvers
+kmod/modules.order
+kmod/snap_bench
+
+# Build artifacts
+build/
