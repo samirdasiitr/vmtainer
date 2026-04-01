@@ -1,0 +1,100 @@
+From: vmtainer developers
+Date: 31 Jul 2025
+Subject: [PATCH] vmm: support loading snapshots from /dev/vmtainer_snap
+
+This patch teaches restore_snapshot_file() to open and mmap the
+vmtainer_snap character device in addition to a regular snapshot file.
+When the snapshot is already resident in kernel-allocated memory, the
+restore path skips filesystem/page-cache/page-fault overhead and parses
+the snapshot from the device mmap exactly as it did from the file mmap.
+
+The on-disk header parsing and the sparse dirty-page copy are unchanged;
+only the source of the mmap is abstracted.
+
+--- a/src/vmm.cpp
++++ b/src/vmm.cpp
+@@ -1,6 +1,8 @@
+ #include <sys/mman.h>
++#include <sys/ioctl.h>
+ #include "vmm.h"
++#include "vmtainer_snap.h"
+ 
+ // existing vmm includes ...
+ 
+@@ -120,25 +122,52 @@ bool Vmm::restore_snapshot_file(const std::string& snapshot_path)
+ {
+-    int fd = open(snapshot_path.c_str(), O_RDONLY);
++    int fd = open(snapshot_path.c_str(), O_RDONLY | O_CLOEXEC);
+     if (fd < 0) {
+-        log_error("failed to open snapshot %s: %s",
+-                  snapshot_path.c_str(), strerror(errno));
++        log_error("failed to open snapshot %s: %m",
++                  snapshot_path.c_str());
+         return false;
+     }
+ 
+-    struct stat st;
+-    if (fstat(fd, &st) < 0) {
+-        log_error("failed to stat snapshot %s: %s",
+-                  snapshot_path.c_str(), strerror(errno));
+-        close(fd);
+-        return false;
+-    }
++    void *snap_base = nullptr;
++    size_t snap_size = 0;
+ 
+-    void *snap_base = mmap(nullptr, st.st_size, PROT_READ,
+-                           MAP_PRIVATE, fd, 0);
+-    if (snap_base == MAP_FAILED) {
+-        log_error("failed to mmap snapshot %s: %s",
+-                  snapshot_path.c_str(), strerror(errno));
+-        close(fd);
+-        return false;
++    if (snapshot_path == "/dev/vmtainer_snap") {
++        /* Kernel-resident snapshot buffer created by vmtainer_snap.ko. */
++        struct vmtainer_snap_info info;
++        if (ioctl(fd, VMTAINER_SNAP_INFO, &info) != 0) {
++            log_error("VMTAINER_SNAP_INFO failed: %m");
++            close(fd);
++            return false;
++        }
++        snap_size = info.size;
++        snap_base = mmap(nullptr, snap_size, PROT_READ,
++                         MAP_SHARED, fd, 0);
++        if (snap_base == MAP_FAILED) {
++            log_error("failed to mmap /dev/vmtainer_snap: %m");
++            close(fd);
++            return false;
++        }
++    } else {
++        /* Traditional file-backed snapshot. */
++        struct stat st;
++        if (fstat(fd, &st) < 0) {
++            log_error("failed to stat snapshot %s: %m",
++                      snapshot_path.c_str());
++            close(fd);
++            return false;
++        }
++        snap_size = st.st_size;
++        snap_base = mmap(nullptr, snap_size, PROT_READ,
++                         MAP_PRIVATE, fd, 0);
++        if (snap_base == MAP_FAILED) {
++            log_error("failed to mmap snapshot %s: %m",
++                      snapshot_path.c_str());
++            close(fd);
++            return false;
++        }
+     }
+ 
+-    // existing header / state / bitmap parsing; use st.st_size for bounds
++    // Existing header / state / bitmap / RAM parsing follows unchanged.
++    // Replace any remaining uses of st.st_size with snap_size when
++    // computing bounds for the cleanup below.
+ 
+     // existing sparse memcpy restore loop ...
+ 
+-    munmap(snap_base, st.st_size);
++    munmap(snap_base, snap_size);
+     close(fd);
+     return true;
+ }

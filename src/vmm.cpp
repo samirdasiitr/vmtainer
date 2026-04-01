@@ -93,6 +93,16 @@ struct vhost_vring_addr {
 #include "bios_rom.h"
 
 // ---------------------------------------------------------------------------
+// Debug logging (enabled with --debug flag)
+// ---------------------------------------------------------------------------
+
+static bool g_debug = false;
+
+#define DBG(fmt, ...) do { \
+    if (g_debug) fprintf(stderr, "[DBG] " fmt "\n", ##__VA_ARGS__); \
+} while (0)
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -586,6 +596,7 @@ bool Vmm::query_msr_list() {
 }
 
 bool Vmm::init(bool zero_ram) {
+    DBG("init: ram_mb=%zu zero_ram=%d", ram_mb_, zero_ram);
     kvm_fd_ = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if (kvm_fd_ < 0) { perror("open /dev/kvm"); return false; }
     if (ioctl(kvm_fd_, KVM_GET_API_VERSION, 0) != 12) {
@@ -618,6 +629,7 @@ bool Vmm::init(bool zero_ram) {
                 MAP_SHARED, ram_memfd_, 0);
     if (ram_ == MAP_FAILED) { perror("mmap ram"); return false; }
     if (zero_ram) memset(ram_, 0, ram_bytes_);
+    DBG("init: ram=%p memfd=%d size=%zuMB", ram_, ram_memfd_, ram_bytes_ >> 20);
 
     if (!set_memslot(0, 0, ram_, ram_bytes_)) return false;
 
@@ -858,6 +870,8 @@ void Vmm::serial_out(uint16_t port, uint8_t data) {
 
 void Vmm::virtio_mmio_read(uint64_t off, uint8_t *data, uint32_t len) {
     uint32_t val = 0;
+    if (off != VIRTIO_MMIO_INTERRUPT_STATUS) // skip noisy irq status polls
+        DBG("virtiofs mmio read: off=0x%lx len=%u", off, len);
 
     switch (off) {
     case VIRTIO_MMIO_MAGIC_VALUE:  val = 0x74726976; break; // "virt"
@@ -966,6 +980,7 @@ void Vmm::virtio_mmio_write(uint64_t off, const uint8_t *data, uint32_t len) {
     case VIRTIO_MMIO_STATUS: {
         uint32_t old = vdev_status_;
         vdev_status_ = val;
+        DBG("virtiofs STATUS: 0x%x -> 0x%x", old, val);
         if (val == 0) {
             // Device reset
             for (auto &q : vqs_) { q = {}; }
@@ -1124,8 +1139,10 @@ bool Vmm::vu_connect(const char *sock_path) {
     // Retry connection with fast exponential backoff
     // virtiofsd typically ready within 10-50ms
     for (int us = 1000; us <= 200000; us = std::min(us * 2, 200000)) {
-        if (connect(vu_sock_, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+        if (connect(vu_sock_, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            DBG("vu_connect: connected after backoff=%dus", us);
             return true;
+        }
         usleep(us);
     }
 
@@ -1193,6 +1210,7 @@ bool Vmm::vu_transact(uint32_t req, const void *payload, uint32_t sz,
 // Early init: get features, set owner, share memory with virtiofsd.
 // Called right after connecting, before the guest boots.
 bool Vmm::vu_early_init() {
+    DBG("vu_early_init: starting vhost-user handshake");
     VhostUserMsg reply = {};
 
     // 1. Get backend features
@@ -1436,8 +1454,10 @@ bool Vmm::setup_virtio_net(const uint8_t mac[6], bool add_cmdline) {
 // Open a TAP device and connect it to the virtio-net backend.
 // Call on restore/clone when network is needed.
 bool Vmm::connect_tap(const char *tap_name) {
+    DBG("connect_tap: name=%s", tap_name);
     tap_fd_ = open_tap(tap_name);
     if (tap_fd_ < 0) return false;
+    DBG("connect_tap: fd=%d", tap_fd_);
     printf("[VMM] TAP connected: %s\n", tap_name);
     return true;
 }
@@ -1445,6 +1465,7 @@ bool Vmm::connect_tap(const char *tap_name) {
 // MMIO read for the virtio-net device
 void Vmm::net_mmio_read(uint64_t off, uint8_t *data, uint32_t len) {
     uint32_t val = 0;
+    DBG("net mmio read: off=0x%lx len=%u", off, len);
 
     switch (off) {
     case VIRTIO_MMIO_MAGIC_VALUE:  val = 0x74726976; break; // "virt"
@@ -1594,6 +1615,7 @@ bool Vmm::vhost_net_setup() {
 
 void *net_thread_func(void *arg) {
     auto *vmm = (Vmm *)arg;
+    DBG("net_thread: started, tap_fd=%d", vmm->tap_fd_);
 
     // Access the queues via the VMM's ram pointer
     auto gpa_to_hva = [&](uint64_t gpa) -> void * {
@@ -1982,6 +2004,8 @@ bool Vmm::save_snapshot(Snapshot &snap) {
 
 bool Vmm::restore_snapshot(const Snapshot &snap) {
     const auto &h = snap.hdr;
+    DBG("restore_snapshot: magic=0x%lx ver=%u ram_mb=%u bitmap=%u bytes",
+        h.magic, h.version, h.ram_mb, h.bitmap_bytes);
     if (h.magic != SNAP_MAGIC || h.version != SNAP_VERSION || h.ram_mb != ram_mb_) {
         fprintf(stderr, "bad snapshot\n");
         return false;
@@ -1999,10 +2023,15 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
 
         if (!snap.dirty_bitmap.empty()) {
             // Fast path: bitmap-guided copy (no reads of zero pages)
+            size_t dirty_count = 0;
             for (size_t pg = 0; pg < total_pages; pg++) {
-                if (snap.dirty_bitmap[pg / 8] & (1 << (pg & 7)))
+                if (snap.dirty_bitmap[pg / 8] & (1 << (pg & 7))) {
                     memcpy(dst + pg * PAGE, src + pg * PAGE, PAGE);
+                    dirty_count++;
+                }
             }
+            DBG("restore: bitmap copy %zu/%zu pages (%zuKB)",
+                dirty_count, total_pages, dirty_count * 4);
         } else {
             // Slow path: scan each page
             for (size_t off = 0; off < ram_bytes_; off += PAGE) {
@@ -2490,6 +2519,11 @@ int main(int argc, char **argv) {
     setbuf(stdout, nullptr);
     setbuf(stderr, nullptr);
     signal(SIGPIPE, SIG_IGN);
+
+    // Check for --debug flag anywhere in args
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug") == 0) { g_debug = true; break; }
+    }
 
     if (argc < 2) { usage(argv[0]); return 1; }
     const char *cmd = argv[1];
