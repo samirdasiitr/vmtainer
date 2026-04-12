@@ -259,22 +259,41 @@ eviction is a concern.
 ### 7.1 Setup
 
 - **Hardware**: Intel i5-14500 (14 cores / 20 threads), 40GB DDR5, NVMe SSD
-- **Test**: Launch N VMs simultaneously from golden snapshot, each running
-  `/bin/true` via virtiofs (Alpine Linux rootfs)
-- **Metric**: VMM-reported restore time (from `vmtainer restore` output)
+- **Test**: Launch N VMs simultaneously from golden snapshot
+- **Two modes**: "Restore-only" measures VMM restore time; "Full E2E"
+  waits for the guest to finish execution (virtiofs mount + entrypoint + halt)
 
-### 7.2 Results
+### 7.2 Restore-Only Results (VMM restore time only)
+
+Each VM runs `vmtainer restore` with virtiofsd, measures the "restored in"
+time. VMs continue executing until timeout (not part of measurement).
 
 ```
-Concurrency    Success   Wall Clock   Restore (p50)   Restore (p99)   Throughput
------------    -------   ----------   -------------   -------------   ----------
-1              1/1       1.6s         13ms            13ms            0.6 VM/s
-10             10/10     1.7s         17ms            24ms            5.9 VM/s
-50             50/50     1.9s         65ms            181ms           26.8 VM/s
-100            100/100   2.1s         73ms            298ms           46.8 VM/s
+N      Success    Wall     Restore p50   virtiofsd p50   Snap p50   Throughput
+----   -------    -----    -----------   -------------   --------   ----------
+1      1/1        1.6s     13ms          1.5ms           12ms       0.6 VM/s
+10     10/10      1.7s     17ms          1.4ms           15ms       5.9 VM/s
+100    100/100    1.9s     57ms          6.8ms           40ms       52.5 VM/s
+150    150/150    2.0s     86ms          20.5ms          47ms       73.3 VM/s
+200    200/200    2.2s     48ms          10.1ms          24ms       92.3 VM/s
+300    300/300    2.6s     132ms         38.5ms          46ms       114.0 VM/s
+500    500/500    3.3s     71ms          22.0ms          28ms       153.4 VM/s
+1000   1000/1000  5.0s     120ms         42.6ms          31ms       199.8 VM/s
 ```
 
-### 7.3 Detailed Breakdown at 100 Concurrent VMs
+### 7.3 Full E2E Results (guest runs /bin/true and halts)
+
+Each VM has its own TAP device, IP address, virtiofsd, and runs `/bin/true`
+inside an Alpine Linux chroot via virtiofs.
+
+```
+N      Success    Wall     Restore p50   Guest p50   Guest p99    Throughput
+----   -------    -----    -----------   ---------   ---------    ----------
+100    100/100    2.1s     73ms          1955ms      2122ms       46.8 VM/s
+200    200/200    15.1s    164ms         2231ms      15054ms      13.3 VM/s
+```
+
+### 7.4 Detailed Breakdown at 100 Concurrent VMs (Full E2E)
 
 ```
 Component              Min      Avg      p50      p90      p99      Max
@@ -286,26 +305,44 @@ Total restore (ms)     25.7     83.7     73.4     163.0    298.2    387.3
 Wall time (ms)        1167    1846     1955      2104     2122     2257
 ```
 
-### 7.4 Scaling Analysis
+### 7.5 Detailed Breakdown at 1000 Concurrent VMs (Restore-Only)
 
-At 100 VMs on 28 logical CPUs:
-- **Restore time scales linearly** with contention (~6x slower at 100 VMs
-  vs 1 VM) due to memory bandwidth saturation (100 * 29MB = 2.9GB total
-  memcpy) and CPU scheduling
-- **virtiofsd contention** increases from 1.5ms (single VM) to 18ms avg
-  (100 VMs) because 100 virtiofsd processes compete for CPU time
-- **Throughput**: 46.8 VMs/sec aggregate, limited by total wall clock time
-  of ~2.1 seconds (guest boot + virtiofs mount + entrypoint + halt)
+```
+Component              Min      Avg      p50      p90      p99      Max
+---------              ---      ---      ---      ---      ---      ---
+Total restore (ms)     17.4    318.5    120.3     874.2   1325.2   1566.6
+  Snapshot copy        12.4     57.1     31.3     121.2    417.5    663.8
+  KVM init              0.3      5.7      2.8      13.0     41.0    105.3
+  virtiofsd startup     1.3    255.7     42.6     703.9   1241.1   1469.4
+```
 
-### 7.5 Scaling Limits
+### 7.6 Scaling Analysis
 
-150+ concurrent VMs showed instability (some VMs hung) due to:
-- CPU oversubscription (150 vmtainer + 150 virtiofsd = 300 processes on 28 CPUs)
-- virtiofsd connection timeout (backoff max 200ms may not be enough)
-- Serial console output contention
+**virtiofsd is NOT the process-count bottleneck.** Even at 1000 VMs
+(2000 total processes: 1000 vmtainer + 1000 virtiofsd), all VMs restore
+successfully. The virtiofsd p50 stays reasonable (42ms at 1000 VMs) but
+the p99 tail grows to 1.2s due to CPU scheduling contention.
 
-**Recommendation**: For 100+ VMs, use batch launching (e.g., 50 at a time)
-or a fork+COW model that shares the golden snapshot in the parent process.
+**The real bottleneck at high concurrency is guest execution:**
+- At 200+ VMs in full E2E mode, 200 vCPUs compete for 28 physical CPUs
+- Each guest must: probe virtio devices, mount virtiofs (FUSE_INIT handshake),
+  configure network (ip addr, ip route), chroot, run /bin/true, halt
+- This guest work dominates wall clock time at high concurrency
+
+**Memory bandwidth** for snapshot copy (29MB per VM) saturates around
+200+ VMs. At 1000 VMs = 29GB total memcpy, the DDR5 bandwidth (~50GB/s)
+becomes the limiting factor.
+
+### 7.7 Recommendations for Production
+
+1. **Batch launching**: Start VMs in waves of 50-100 to avoid overwhelming
+   the scheduler
+2. **CPU pinning**: Use `taskset` to pin each vmtainer+virtiofsd pair to
+   a specific CPU set
+3. **Pre-fork COW**: Load the snapshot once in a parent process and fork
+   for each clone -- eliminates the 29MB per-VM memcpy entirely
+4. **Reduce guest work**: Use a minimal init that skips network config
+   when not needed
 
 ## 8. Guest Kernel Configuration
 
