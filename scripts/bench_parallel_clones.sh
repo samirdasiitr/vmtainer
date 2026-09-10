@@ -4,7 +4,7 @@
 set -euo pipefail
 
 COUNT=${1:-100}
-ROOTFS=${2:-/tmp/vmtainer-nginx-rootfs}
+ROOTFS=${2:-/tmp/alpine-rootfs}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VMTAINER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VMTAINER=$VMTAINER_DIR/build/vmm/vmtainer

@@ -291,8 +291,32 @@ void Vmm::serial_out(uint16_t port, uint8_t data) {
     case 0x3f8:
         if (dlab) { uart_dll_ = data; break; }
         putchar(data);
-        // Optimization: flush on newline instead of every single character
-        if (data == '\n') fflush(stdout);
+        if (data == '\n') {
+            fflush(stdout);
+            if (timing_entrypoint_ && !entrypoint_measured_) {
+                if (serial_line_buf_.find("VMTAINER: running entrypoint") != std::string::npos) {
+                    entrypoint_measured_ = true;
+                    struct timespec now;
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    long us_total = (now.tv_sec - t_cmd_start_.tv_sec) * 1000000L +
+                                    (now.tv_nsec - t_cmd_start_.tv_nsec) / 1000L;
+                    long us_guest = (now.tv_sec - t_vcpu_start_.tv_sec) * 1000000L +
+                                    (now.tv_nsec - t_vcpu_start_.tv_nsec) / 1000L;
+                    long us_vmm = us_total > us_guest ? us_total - us_guest : 0;
+                    time_to_entrypoint_ms_ = us_total / 1000.0;
+
+                    printf("\n[VMM] ====================================================\n");
+                    printf("[VMM] TIME TO START OF ENTRYPOINT EXECUTION: %.2fms\n", us_total / 1000.0);
+                    printf("[VMM]   - VMM setup & snapshot restore:        %.2fms\n", us_vmm / 1000.0);
+                    printf("[VMM]   - Guest mount & init to entrypoint:    %.2fms\n", us_guest / 1000.0);
+                    printf("[VMM] ====================================================\n\n");
+                    fflush(stdout);
+                }
+            }
+            serial_line_buf_.clear();
+        } else if (serial_line_buf_.size() < 256) {
+            serial_line_buf_ += (char)data;
+        }
         {
             struct kvm_irq_level irq = {};
             irq.irq = 4;
@@ -326,10 +350,11 @@ int Vmm::run() {
                     struct kvm_mp_state mp = {};
                     if (ioctl(vcpu_fd_, KVM_GET_MP_STATE, &mp) == 0 &&
                         mp.mp_state == KVM_MP_STATE_HALTED) {
-                        return 0;
+                        if (++consecutive_hlt_eintr >= 2)
+                            return 0;
+                    } else {
+                        consecutive_hlt_eintr = 0;
                     }
-                    if (++consecutive_hlt_eintr >= 2)
-                        return 0;
                 } else {
                     consecutive_hlt_eintr = 0;
                 }
@@ -552,64 +577,71 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
         size_t total_pages = ram_bytes_ / PAGE;
 
         if (!snap.dirty_bitmap.empty()) {
-            struct CopyWork {
+            constexpr size_t CHUNK_PAGES = 256; // 1MB per chunk
+            size_t num_chunks = (total_pages + CHUNK_PAGES - 1) / CHUNK_PAGES;
+            std::atomic<size_t> chunk_idx{0};
+
+            struct SharedCopyContext {
                 const uint8_t *src;
                 uint8_t *dst;
                 const uint8_t *bitmap;
-                size_t pg_start;
-                size_t pg_end;
-                size_t dirty_count;
-            };
+                size_t total_pages;
+                size_t num_chunks;
+                std::atomic<size_t> *chunk_idx;
+                std::atomic<size_t> total_dirty{0};
+            } ctx;
 
-            auto copy_worker = [](void *arg) -> void * {
-                auto *w = (CopyWork *)arg;
-                size_t count = 0;
-                size_t pg = w->pg_start;
-                while (pg < w->pg_end) {
-                    if (!(w->bitmap[pg / 8] & (1 << (pg & 7)))) { pg++; continue; }
-                    size_t run_start = pg;
-                    while (pg < w->pg_end &&
-                           (w->bitmap[pg / 8] & (1 << (pg & 7)))) {
-                        pg++;
+            ctx.src = src;
+            ctx.dst = dst;
+            ctx.bitmap = snap.dirty_bitmap.data();
+            ctx.total_pages = total_pages;
+            ctx.num_chunks = num_chunks;
+            ctx.chunk_idx = &chunk_idx;
+
+            auto dynamic_copy_worker = [](void *arg) -> void * {
+                auto *c = (SharedCopyContext *)arg;
+                size_t local_dirty = 0;
+                while (true) {
+                    size_t ch = c->chunk_idx->fetch_add(1, std::memory_order_relaxed);
+                    if (ch >= c->num_chunks) break;
+
+                    size_t pg_start = ch * CHUNK_PAGES;
+                    size_t pg_end = std::min(pg_start + CHUNK_PAGES, c->total_pages);
+                    size_t pg = pg_start;
+
+                    while (pg < pg_end) {
+                        if (!(c->bitmap[pg / 8] & (1 << (pg & 7)))) { pg++; continue; }
+                        size_t run_start = pg;
+                        while (pg < pg_end && (c->bitmap[pg / 8] & (1 << (pg & 7)))) {
+                            pg++;
+                        }
+                        size_t run_len = pg - run_start;
+                        local_dirty += run_len;
+                        memcpy(c->dst + run_start * 4096,
+                               c->src + run_start * 4096,
+                               run_len * 4096);
                     }
-                    size_t run_len = pg - run_start;
-                    count += run_len;
-                    memcpy(w->dst + run_start * 4096,
-                           w->src + run_start * 4096,
-                           run_len * 4096);
                 }
-                w->dirty_count = count;
+                c->total_dirty.fetch_add(local_dirty, std::memory_order_relaxed);
                 return nullptr;
             };
 
-            int NUM_COPY_THREADS = copy_threads_;
-            std::vector<CopyWork> work(NUM_COPY_THREADS);
-            std::vector<pthread_t> threads(NUM_COPY_THREADS);
-            size_t pages_per = total_pages / NUM_COPY_THREADS;
+            int NUM_COPY_THREADS = copy_threads_ > 0 ? copy_threads_ : 4;
+            if (NUM_COPY_THREADS > 8) NUM_COPY_THREADS = 8;
+            std::vector<pthread_t> threads(NUM_COPY_THREADS - 1);
 
-            for (int t = 0; t < NUM_COPY_THREADS; t++) {
-                work[t].src = src;
-                work[t].dst = dst;
-                work[t].bitmap = snap.dirty_bitmap.data();
-                work[t].pg_start = t * pages_per;
-                work[t].pg_end = (t == NUM_COPY_THREADS - 1) ? total_pages : (t + 1) * pages_per;
-                work[t].dirty_count = 0;
-                if (NUM_COPY_THREADS > 1)
-                    pthread_create(&threads[t], nullptr, copy_worker, &work[t]);
+            for (int t = 0; t < NUM_COPY_THREADS - 1; t++) {
+                pthread_create(&threads[t], nullptr, dynamic_copy_worker, &ctx);
             }
+            // Main thread participates in copying
+            dynamic_copy_worker(&ctx);
 
-            size_t dirty_count = 0;
-            if (NUM_COPY_THREADS == 1) {
-                copy_worker(&work[0]);
-                dirty_count = work[0].dirty_count;
-            } else {
-                for (int t = 0; t < NUM_COPY_THREADS; t++) {
-                    pthread_join(threads[t], nullptr);
-                    dirty_count += work[t].dirty_count;
-                }
+            for (int t = 0; t < NUM_COPY_THREADS - 1; t++) {
+                pthread_join(threads[t], nullptr);
             }
+            size_t dirty_count = ctx.total_dirty.load();
 
-            DBG("restore: bitmap copy %zu/%zu pages (%zuKB) [%d threads, coalesced]",
+            DBG("restore: bitmap copy %zu/%zu pages (%zuKB) [%d threads, dynamic coalesced]",
                 dirty_count, total_pages, dirty_count * 4, NUM_COPY_THREADS);
         } else {
             for (size_t off = 0; off < ram_bytes_; off += PAGE) {
@@ -776,7 +808,7 @@ bool Vmm::restore_snapshot_file(const char *path) {
     void *map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) { perror("mmap snap"); close(fd); return false; }
 
-    madvise(map, std::min((size_t)st.st_size, (size_t)(256 * 1024)), MADV_WILLNEED);
+    madvise(map, st.st_size, MADV_WILLNEED);
 
     clock_gettime(CLOCK_MONOTONIC, &tf1);
 
@@ -814,7 +846,8 @@ bool Vmm::restore_snapshot_file(const char *path) {
     snap.ram_size = snap.hdr.ram_mb * 1024ULL * 1024;
     if (remain < snap.ram_size) { munmap(map, st.st_size); close(fd); return false; }
     snap.ram = (void *)p;
-    madvise((void *)p, snap.ram_size, MADV_RANDOM);
+    madvise((void *)p, snap.ram_size, MADV_WILLNEED);
+    if (ram_) madvise(ram_, ram_bytes_, MADV_WILLNEED);
 
     clock_gettime(CLOCK_MONOTONIC, &tf2);
 
@@ -1089,8 +1122,10 @@ static void write_config_to_share(const char *share_dir, const VmConfig &cfg) {
         fprintf(f, "NET_MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
                 cfg.mac[0], cfg.mac[1], cfg.mac[2],
                 cfg.mac[3], cfg.mac[4], cfg.mac[5]);
-    for (int i = 0; i < cfg.num_env; i++)
-        fprintf(f, "ENV_%s=%s\n", cfg.env[i].key, cfg.env[i].val);
+    for (int i = 0; i < cfg.num_env; i++) {
+        fprintf(f, "export %s=\"%s\"\n", cfg.env[i].key, cfg.env[i].val);
+        fprintf(f, "ENV_%s=\"%s\"\n", cfg.env[i].key, cfg.env[i].val);
+    }
     fclose(f);
 }
 
@@ -1197,6 +1232,7 @@ int main(int argc, char **argv) {
         }
 
         Vmm vmm(snap_ram_mb);
+        vmm.set_cmd_start(t0);
         if (ct_str) vmm.set_copy_threads(atoi(ct_str));
         if (has_flag(argc, argv, "--hugetlb")) vmm.set_hugetlb(true);
         if (!vmm.init(false)) return 1;
@@ -1228,6 +1264,10 @@ int main(int argc, char **argv) {
                us_virtiofsd / 1000.0,
                (us_setup - us_init - us_virtiofsd) / 1000.0,
                us_snap / 1000.0);
+
+        struct timespec t_run;
+        clock_gettime(CLOCK_MONOTONIC, &t_run);
+        vmm.set_vcpu_start(t_run);
         return (vmm.run() >= 0) ? 0 : 1;
     }
 

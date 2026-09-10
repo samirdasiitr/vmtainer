@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include <fcntl.h>
@@ -195,6 +196,9 @@ public:
 
     void set_copy_threads(int n) { copy_threads_ = n > 0 ? n : 1; }
     void set_hugetlb(bool v) { use_hugetlb_ = v; }
+    void set_cmd_start(const struct timespec &ts) { t_cmd_start_ = ts; timing_entrypoint_ = true; }
+    void set_vcpu_start(const struct timespec &ts) { t_vcpu_start_ = ts; }
+    double time_to_entrypoint_ms() const { return time_to_entrypoint_ms_; }
 
 private:
     void cleanup();
@@ -316,4 +320,12 @@ private:
 
     // Number of threads for parallel snapshot restore memcpy (default 2)
     int copy_threads_ = 2;
+
+    // Entrypoint timing measurement
+    struct timespec t_cmd_start_ = {};
+    struct timespec t_vcpu_start_ = {};
+    bool timing_entrypoint_ = false;
+    bool entrypoint_measured_ = false;
+    std::string serial_line_buf_;
+    double time_to_entrypoint_ms_ = 0.0;
 };

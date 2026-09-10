@@ -14,7 +14,7 @@ VMTAINER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VMTAINER=$VMTAINER_DIR/build/vmm/vmtainer
 GOLDEN=$VMTAINER_DIR/images/golden.snap
 RESULTS_DIR=/tmp/vmtainer-restonly-$$
-ROOTFS=/tmp/vmtainer-nginx-rootfs
+ROOTFS=${3:-/tmp/alpine-rootfs}
 
 echo "=== vmtainer restore-only benchmark ==="
 echo "  Count:   $COUNT"

@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VMTAINER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VMTAINER=$VMTAINER_DIR/build/vmm/vmtainer
 GOLDEN=$VMTAINER_DIR/images/golden.snap
-ROOTFS=/tmp/vmtainer-nginx-rootfs
+ROOTFS=${2:-/tmp/alpine-rootfs}
 RESULTS_DIR=/tmp/vmtainer-e2e-$$
 SUBNET="10.100"
 

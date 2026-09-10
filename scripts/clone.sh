@@ -22,22 +22,29 @@ NET_IP="10.0.0.2/24"
 NET_GW="10.0.0.1"
 HOSTNAME="vmtainer"
 TAP_DEV="tap0"
+PRE_ROOTFS=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --cmd)   CMD="$2"; shift 2;;
-        --ip)    NET_IP="$2"; shift 2;;
-        --gw)    NET_GW="$2"; shift 2;;
-        --name)  HOSTNAME="$2"; shift 2;;
-        --tap)   TAP_DEV="$2"; shift 2;;
-        *)       echo "Unknown arg: $1"; exit 1;;
+        --cmd)     CMD="$2"; shift 2;;
+        --ip)      NET_IP="$2"; shift 2;;
+        --gw)      NET_GW="$2"; shift 2;;
+        --name)    HOSTNAME="$2"; shift 2;;
+        --tap)     TAP_DEV="$2"; shift 2;;
+        --rootfs)  PRE_ROOTFS="$2"; shift 2;;
+        *)         echo "Unknown arg: $1"; exit 1;;
     esac
 done
 
 # Generate a unique clone ID
 CLONE_ID="clone-$(date +%s)-$$"
 CLONE_DIR="$CLONE_BASE/$CLONE_ID"
-ROOTFS="$CLONE_DIR/rootfs"
+if [ -n "$PRE_ROOTFS" ]; then
+    ROOTFS="$PRE_ROOTFS"
+else
+    ROOTFS="$CLONE_DIR/rootfs"
+fi
+mkdir -p "$CLONE_DIR"
 
 echo "=== vmtainer clone ==="
 echo "  Image:     $IMAGE"
@@ -45,27 +52,31 @@ echo "  Clone ID:  $CLONE_ID"
 echo "  Rootfs:    $ROOTFS"
 echo ""
 
-mkdir -p "$ROOTFS"
-
 # ---------- Step 1: Pull & extract image ----------
-T0=$(date +%s%N)
-echo "[1/4] Pulling image..."
+if [ -n "$PRE_ROOTFS" ]; then
+    PULL_MS=0
+    echo "[1/4] Using pre-extracted rootfs (skipped pull & extract)"
+else
+    mkdir -p "$ROOTFS"
+    T0=$(date +%s%N)
+    echo "[1/4] Pulling image..."
 
-# Use docker to create a container and export its filesystem
-CONTAINER_ID=$(docker create "$IMAGE" /bin/true 2>/dev/null)
-if [ -z "$CONTAINER_ID" ]; then
-    echo "  docker pull first..."
-    docker pull "$IMAGE" >/dev/null 2>&1
+    # Use docker to create a container and export its filesystem
     CONTAINER_ID=$(docker create "$IMAGE" /bin/true 2>/dev/null)
+    if [ -z "$CONTAINER_ID" ]; then
+        echo "  docker pull first..."
+        docker pull "$IMAGE" >/dev/null 2>&1
+        CONTAINER_ID=$(docker create "$IMAGE" /bin/true 2>/dev/null)
+    fi
+
+    echo "[2/4] Extracting rootfs..."
+    docker export "$CONTAINER_ID" | tar -xf - -C "$ROOTFS" 2>/dev/null
+    docker rm "$CONTAINER_ID" >/dev/null 2>&1
+
+    T1=$(date +%s%N)
+    PULL_MS=$(( (T1 - T0) / 1000000 ))
+    echo "  Extracted to $ROOTFS (${PULL_MS}ms)"
 fi
-
-echo "[2/4] Extracting rootfs..."
-docker export "$CONTAINER_ID" | tar -xf - -C "$ROOTFS" 2>/dev/null
-docker rm "$CONTAINER_ID" >/dev/null 2>&1
-
-T1=$(date +%s%N)
-PULL_MS=$(( (T1 - T0) / 1000000 ))
-echo "  Extracted to $ROOTFS (${PULL_MS}ms)"
 
 # Get image metadata for default CMD if not overridden
 if [ -z "$CMD" ]; then
@@ -109,19 +120,34 @@ ENDJSON
 echo "[4/4] Restoring VM from snapshot..."
 T2=$(date +%s%N)
 
-$VMTAINER_BIN restore "$GOLDEN_SNAP" --config "$CONFIG_FILE" 2>&1
-RC=$?
+TMP_LOG=$(mktemp)
+$VMTAINER_BIN restore "$GOLDEN_SNAP" --config "$CONFIG_FILE" 2>&1 | tee "$TMP_LOG"
+RC=${PIPESTATUS[0]}
 
 T3=$(date +%s%N)
-RESTORE_MS=$(( (T3 - T2) / 1000000 ))
+TOTAL_VM_MS=$(( (T3 - T2) / 1000000 ))
+SNAP_RESTORE_MS=$(grep -oP 'restored in \K[0-9.]+' "$TMP_LOG" | head -1 || echo "")
+ENTRYPOINT_MS=$(grep -oP 'TIME TO START OF ENTRYPOINT EXECUTION: \K[0-9.]+' "$TMP_LOG" | head -1 || echo "")
+rm -f "$TMP_LOG"
 
 echo ""
 echo "=== Clone complete ==="
-echo "  Pull+extract: ${PULL_MS}ms"
-echo "  VM restore:   ${RESTORE_MS}ms"
-echo "  Total:        $(( PULL_MS + RESTORE_MS ))ms"
-echo "  Exit code:    $RC"
+echo "  Pull+extract:       ${PULL_MS}ms"
+if [ -n "$SNAP_RESTORE_MS" ]; then
+echo "  Snapshot restore:   ${SNAP_RESTORE_MS}ms"
+fi
+if [ -n "$ENTRYPOINT_MS" ]; then
+echo "  Time to entrypoint: ${ENTRYPOINT_MS}ms"
+fi
+echo "  Total VM runtime:   ${TOTAL_VM_MS}ms"
+echo "  Total E2E time:     $(( PULL_MS + TOTAL_VM_MS ))ms"
+echo "  Exit code:          $RC"
 
 # Cleanup
-rm -rf "$CLONE_DIR"
+if [ -z "$PRE_ROOTFS" ]; then
+    rm -rf "$CLONE_DIR"
+else
+    rm -f "$CONFIG_FILE" "$ROOTFS/.entrypoint" "$ROOTFS/.vmconfig"
+    rmdir "$CLONE_DIR" 2>/dev/null || true
+fi
 exit $RC
