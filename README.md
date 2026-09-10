@@ -571,7 +571,67 @@ becomes the limiting factor.
 4. **Reduce guest work**: Use a minimal init that skips network config
    when not needed
 
-## 9. Guest Kernel Configuration
+## 9. Memory Expansion Benchmark: Scaling Clones up to 512MB+
+
+### 9.1 The Memory Expansion Challenge in Cloned Micro-VMs
+
+When cloning container micro-VMs from a golden snapshot, workloads often require more RAM than the minimal footprint used during snapshot capture (e.g. 512MB or 1GB instead of 64MB). However:
+- **e820 Immutability**: The x86 BIOS/e820 physical memory map is parsed only once during early Linux boot (`setup_arch()`). At boot time, Linux initializes `max_pfn`, `vmemmap` page structures, buddy allocator zones, and direct physical mappings. Modifying e820 at snapshot restore time does not alter the guest kernel's memory management limits.
+- **The Solution**: The golden snapshot is created with a large memory configuration (e.g. `--ram 512` or `--ram 1024`). Because Linux only touches ~36MB during early boot, **only 9,313 out of 131,072 pages (7%) are dirty** in the snapshot. The remaining 475MB remains sparse and unallocated in host `memfd`.
+
+### 9.2 The Three Architectural Approaches Tested
+
+We evaluated three architectural strategies for restoring and expanding memory from this 512MB snapshot:
+
+1. **Approach A (Full Lazy Restore via `userfaultfd`)**:
+   - Copies **zero memory upfront** at restore time.
+   - All accesses to snapshot pages trap to userspace and are resolved via `UFFDIO_COPY`.
+   - All accesses to new/expansion memory trap to userspace and are zero-filled via `UFFDIO_ZEROPAGE`.
+2. **Approach B (Midway Approach with `userfaultfd` for New Memory -- `--midway-uffd`)**:
+   - Copies the 36.4MB of dirty snapshot pages upfront into guest RAM using multi-threaded coalesced `memcpy`.
+   - Snapshot pages run with zero page faults at 100% native hardware speed.
+   - `userfaultfd` is registered on guest RAM; any new expansion memory allocated by the guest traps to userspace and is resolved via `UFFDIO_ZEROPAGE`.
+3. **Approach C (Midway Approach with Native Kernel Demand Paging -- `--no-uffd`)**:
+   - Copies the 36.4MB of dirty snapshot pages upfront into guest RAM.
+   - **Zero `userfaultfd` overhead**.
+   - Any new memory expansion is demand-paged directly inside the Linux host kernel via `shmem_fault()` / zero-filling on first write (0 userspace context switches).
+
+### 9.3 Benchmark Results: 200MB Memory Expansion Workload
+
+Workload: Dedicated micro-benchmark (`test_rootfs/bin/mem_bench 200`) allocating 200MB (51,200 pages) and writing to every 4KB page:
+
+| Metric | Approach A<br>**(Full Lazy uffd)** | Approach B<br>**(Midway uffd)** | Approach C<br>**(Native Demand Paging)** | Performance Winner |
+| :--- | :---: | :---: | :---: | :--- |
+| **VMM Setup & Restore** | **4.02 ms** | 16.26 ms | 18.02 ms | **Approach A** (4.5x faster VMM return) |
+| *-- Snapshot Memory Copy* | *0.28 ms* | *11.34 ms* | *12.80 ms* | *Approach A copies 0 MB upfront* |
+| **Guest Init to Entrypoint** | 13.69 ms | 4.59 ms | **1.80 ms** | **Approach C** (7.6x faster guest boot) |
+| **Time to Entrypoint Start** | **17.72 ms** | 20.87 ms | 19.84 ms | **Approach A** (by ~2ms) |
+| **200MB Expansion Latency** | 451.06 ms | 432.54 ms | **114.19 ms** | **Approach C** (**3.9x faster** memory write) |
+| **Memory Expansion Bandwidth** | 443.84 MB/s | 462.42 MB/s | **1,751.58 MB/s** | **Approach C** (**1.75 GB/s bandwidth**) |
+| **UFFD Faults Handled** | 53,243 | 51,046 | **0** | **Approach C** (0 context switches) |
+| **Total Container Wall Time** | 489.37 ms | 472.26 ms | **141.56 ms** | **Approach C** (**3.5x faster overall**) |
+
+### 9.4 Benchmark Results: Lightweight Container Workload (`/entrypoint.sh`)
+
+| Metric | Approach A<br>**(Full Lazy uffd)** | Approach B<br>**(Midway uffd)** | Approach C<br>**(Native Demand Paging)** | Performance Winner |
+| :--- | :---: | :---: | :---: | :--- |
+| **VMM Restore Latency** | **5.80 ms** | 21.64 ms | 21.64 ms | **Approach A** |
+| **Time to Entrypoint Start** | 32.49 ms | 26.98 ms | **23.37 ms** | **Approach C** (starts ~9ms earlier) |
+| **Total Container Wall Time** | 83.43 ms | 70.20 ms | **31.27 ms** | **Approach C** (**2.7x faster** end-to-end) |
+
+### 9.5 Architectural Takeaways & Analysis
+
+1. **The Context Switch Tax of `userfaultfd`**:
+   In both Approach A and Approach B, every 4KB page touched in the unpopulated expansion region triggers:
+   `KVM VM-Exit -> host kernel uffd trap -> userspace thread poll -> ioctl(UFFDIO_ZEROPAGE) -> return to KVM -> resume vCPU`.
+   Over 51,200 pages, this loop executes 51,200 consecutive times, consuming **~430ms** (averaging ~8.4µs per cycle) and capping memory bandwidth at **~460 MB/s**.
+2. **Why Native Kernel Demand Paging Wins at Runtime**:
+   When guest RAM is backed by sparse `memfd` and no `userfaultfd` is registered on the expansion range, the host kernel resolves missing pages directly inside `shmem_fault()` / `do_anonymous_page()` in kernel context with **zero context switches**. This achieves **1,751 MB/s** throughput (almost 4x faster) and finishes the entire container lifecycle in **141.56 ms** (3.5x faster).
+3. **Production Recommendations**:
+   - Use **Approach A (`--uffd`)** if the orchestrator KPI requires sub-5ms VMM invocation latency and workloads allocate minimal memory (<5MB).
+   - Use **Approach C (`--no-uffd`)** as the production default for general workloads, as it eliminates all userfaultfd context switches and delivers 3.9x higher memory expansion throughput.
+
+## 10. Guest Kernel Configuration
 
 Minimal Linux 6.10 kernel with only required subsystems:
 
@@ -598,7 +658,7 @@ virtio_mmio.device=0x1000@0xd0001000:5
 virtio_mmio.device=0x1000@0xd0002000:6
 ```
 
-## 10. CRI Plugin Architecture
+## 11. CRI Plugin Architecture
 
 The CRI (Container Runtime Interface) plugin enables Kubernetes to use
 vmtainer as a container runtime.
@@ -619,7 +679,7 @@ kubelet --container-runtime-endpoint=unix:///var/run/vmtainer.sock
     process   process   device  cache
 ```
 
-### 10.1 Pod Sandbox Lifecycle
+### 11.1 Pod Sandbox Lifecycle
 
 ```
 RunPodSandbox    -> allocate TAP + IP, write config.json
@@ -629,7 +689,7 @@ StopPodSandbox   -> SIGTERM vmtainer, cleanup TAP
 RemovePodSandbox -> remove metadata + rootfs
 ```
 
-### 10.2 Key Design Decisions
+### 11.2 Key Design Decisions
 
 - **1:1 pod:VM mapping**: Each pod sandbox is one VM
 - **Image cache**: OCI images extracted to `/var/lib/vmtainer/images/<hash>/rootfs/`
@@ -637,7 +697,7 @@ RemovePodSandbox -> remove metadata + rootfs
 - **Networking**: TAP devices (`vmtap0..N`) with IP from configurable subnet
 - **Exec**: Side-channel via virtiofs (write command JSON, poll for result)
 
-## 11. Debug Logging
+## 12. Debug Logging
 
 Debug output is available via the `--debug` flag. When enabled, the VMM
 emits detailed trace information to stderr with `[DBG]` prefix:
@@ -669,9 +729,9 @@ Logged events:
 - Virtio device status transitions
 - Net thread lifecycle
 
-## 12. Future Work
+## 13. Future Work
 
-### 12.1 Pre-fork with COW
+### 13.1 Pre-fork with COW
 
 For the `clone` command, load the golden snapshot in a parent process and
 `fork()` for each clone. The forked child inherits the parent's RAM via
@@ -679,20 +739,20 @@ COW (copy-on-write) page tables, avoiding upfront memory setup entirely.
 The child then creates its own KVM VM and maps the inherited RAM.
 Expected benefit: **~1.5ms restore** (KVM init + virtiofsd only).
 
-### 12.2 Compressed Snapshots
+### 13.2 Compressed Snapshots
 
 Store only dirty pages in the snapshot file (skip zero pages entirely).
 Reduces file size from 65MB to ~30MB, improving cold-cache restore.
 Could also apply LZ4 compression for further reduction.
 
-### 12.3 Huge Pages (2MB)
+### 13.3 Huge Pages (2MB)
 
 Using 2MB huge pages for guest RAM would:
 - Reduce TLB misses during memory access (16 TLB entries vs 7458)
 - Reduce page fault count during demand-paged restore
 - Improve guest execution performance
 
-### 12.4 vhost-net Kernel Data Path
+### 13.4 vhost-net Kernel Data Path
 
 Currently virtio-net uses a userspace packet forwarding thread. Switching
 to the kernel vhost-net data path (`/dev/vhost-net`) would:
@@ -700,33 +760,35 @@ to the kernel vhost-net data path (`/dev/vhost-net`) would:
 - Reduce network latency
 - Free one CPU thread per VM
 
-## 13. File Inventory
+## 14. File Inventory
 
 ```
-src/vmm.cpp                    VMM core implementation (C++17, ~2700 LOC)
-src/vmm.hpp                    VMM class and snapshot data structures
-src/virtio.cpp                 Virtiofs & virtio-net transport and backoff logic
-src/virtio.hpp                 Virtio device transport definitions
-src/boot.hpp                   Linux boot protocol helpers
-src/bios_rom.h, bios.bin       Custom minimal BIOS
-initrd_src/init.c              Static C guest init binary (~300 LOC)
-scripts/build_vmm.sh           Build script for VMM
-scripts/build_kernel.sh        Kernel build script
-scripts/build_initrd.sh        initrd build script (compiles init.c statically)
-scripts/clone.sh               OCI image clone helper
-images/bzImage                 Compiled kernel
-images/initrd.cpio.gz          initrd with static C init
-images/golden.snap             Golden snapshot (~65MB)
-cri/cmd/vmtainer-cri/main.go   CRI gRPC server
-cri/pkg/runtime/runtime.go     RuntimeService implementation
-cri/pkg/runtime/image.go       ImageService implementation
-cri/pkg/vmm/vmm.go             vmtainer binary wrapper
-cri/pkg/store/store.go         Metadata store
-cri/pkg/network/cni.go         Network management
-LICENSE                        Proprietary license and commercial use terms
+src/vmm.cpp                         VMM core implementation (C++17, ~2700 LOC)
+src/vmm.hpp                         VMM class and snapshot data structures
+src/virtio.cpp                      Virtiofs & virtio-net transport and backoff logic
+src/virtio.hpp                      Virtio device transport definitions
+src/boot.hpp                        Linux boot protocol helpers
+src/bios_rom.h, bios.bin            Custom minimal BIOS
+initrd_src/init.c                   Static C guest init binary (~300 LOC)
+scripts/build_vmm.sh                Build script for VMM
+scripts/build_kernel.sh             Kernel build script
+scripts/build_initrd.sh             initrd build script (compiles init.c statically)
+scripts/clone.sh                    OCI image clone helper
+scripts/bench_memory_approaches.sh  Automated memory expansion benchmark harness
+scripts/mem_bench.c                 Standalone guest memory microbenchmark
+images/bzImage                      Compiled kernel
+images/initrd.cpio.gz               initrd with static C init
+images/golden.snap                  Golden snapshot (~65MB)
+cri/cmd/vmtainer-cri/main.go        CRI gRPC server
+cri/pkg/runtime/runtime.go          RuntimeService implementation
+cri/pkg/runtime/image.go            ImageService implementation
+cri/pkg/vmm/vmm.go                  vmtainer binary wrapper
+cri/pkg/store/store.go              Metadata store
+cri/pkg/network/cni.go              Network management
+LICENSE                             Proprietary license and commercial use terms
 ```
 
-## 14. License & Commercial Use
+## 15. License & Commercial Use
 
 Copyright (c) 2026 Samir Das. All rights reserved.
 

@@ -84,7 +84,7 @@ bool Vmm::init(bool zero_ram) {
     if (zero_ram) memset(ram_, 0, ram_bytes_);
     DBG("init: ram=%p memfd=%d size=%zuMB hugetlb=%d", ram_, ram_memfd_, ram_bytes_ >> 20, use_hugetlb_);
 
-    if (use_uffd_ && !init_uffd()) {
+    if (use_uffd_ && !midway_uffd_ && !init_uffd()) {
         DBG("init: userfaultfd init failed, falling back to memcpy restore");
         use_uffd_ = false;
     }
@@ -686,6 +686,7 @@ void Vmm::uffd_worker() {
                     break;
                 }
                 total_faults++;
+                uffd_fault_count_.store(total_faults, std::memory_order_relaxed);
             } else {
                 struct uffdio_zeropage zero = {};
                 zero.range.start = fault_addr;
@@ -697,6 +698,7 @@ void Vmm::uffd_worker() {
                     break;
                 }
                 total_faults++;
+                uffd_fault_count_.store(total_faults, std::memory_order_relaxed);
             }
         }
     }
@@ -723,7 +725,7 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
     clock_gettime(CLOCK_MONOTONIC, &ts0);
 
     // Restore guest RAM
-    if (use_uffd_ && uffd_ >= 0) {
+    if (use_uffd_ && !midway_uffd_ && uffd_ >= 0) {
         if (!snap_ram_) {
             snap_ram_ = (const uint8_t *)snap.ram;
             snap_bitmap_buf_ = snap.dirty_bitmap;
@@ -858,6 +860,15 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
                     acc |= p[w] | p[w+1] | p[w+2] | p[w+3] |
                            p[w+4] | p[w+5] | p[w+6] | p[w+7];
                 if (acc) memcpy(dst + off, src + off, PAGE);
+            }
+        }
+
+        if (midway_uffd_) {
+            if (!init_uffd()) {
+                fprintf(stderr, "[VMM] midway uffd: init_uffd failed: %s\n", strerror(errno));
+            } else {
+                start_uffd_thread();
+                DBG("restore: midway uffd active (snapshot copied upfront, remainder via uffd)");
             }
         }
     }
@@ -1078,7 +1089,7 @@ bool Vmm::restore_snapshot_file(const char *path) {
 
     snap.ram = nullptr;
     snap.ram_size = 0;
-    if (!use_uffd_ || uffd_ < 0) {
+    if ((!use_uffd_ && !midway_uffd_) || uffd_ < 0) {
         munmap(map, st.st_size);
         close(fd);
         snap_mmap_base_ = nullptr;
@@ -1475,8 +1486,16 @@ int main(int argc, char **argv) {
         vmm.set_cmd_start(t0);
         if (ct_str) vmm.set_copy_threads(atoi(ct_str));
         if (has_flag(argc, argv, "--hugetlb")) vmm.set_hugetlb(true);
-        if (has_flag(argc, argv, "--no-uffd")) vmm.set_uffd(false);
-        else vmm.set_uffd(true);
+        if (has_flag(argc, argv, "--midway-uffd")) {
+            vmm.set_midway_uffd(true);
+            vmm.set_uffd(false);
+        } else if (has_flag(argc, argv, "--no-uffd")) {
+            vmm.set_uffd(false);
+            vmm.set_midway_uffd(false);
+        } else {
+            vmm.set_uffd(true);
+            vmm.set_midway_uffd(false);
+        }
         if (!vmm.init(false)) return 1;
         long us_init = us_since(t0);
 
@@ -1502,18 +1521,23 @@ int main(int argc, char **argv) {
 
         if (vmm.timing_entrypoint())
             printf("[+%6.2fms] ", vmm.ms_since_start());
-        printf("[VMM] restored in %.1fms  kvm_init=%.1fms virtiofsd=%.1fms tap=%.1fms snap=%.1fms (uffd=%d)\n",
+        printf("[VMM] restored in %.1fms  kvm_init=%.1fms virtiofsd=%.1fms tap=%.1fms snap=%.1fms (uffd=%d midway=%d)\n",
                us_since(t0) / 1000.0,
                us_init / 1000.0,
                us_virtiofsd / 1000.0,
                (us_setup - us_init - us_virtiofsd) / 1000.0,
                us_snap / 1000.0,
-               vmm.use_uffd() ? 1 : 0);
+               vmm.use_uffd() ? 1 : 0,
+               vmm.midway_uffd() ? 1 : 0);
 
         struct timespec t_run;
         clock_gettime(CLOCK_MONOTONIC, &t_run);
         vmm.set_vcpu_start(t_run);
-        return (vmm.run() >= 0) ? 0 : 1;
+        int rc = vmm.run();
+        if (vmm.use_uffd() || vmm.midway_uffd()) {
+            printf("[VMM] uffd page faults handled: %zu\n", vmm.uffd_fault_count());
+        }
+        return (rc >= 0) ? 0 : 1;
     }
 
     // ── clone ──

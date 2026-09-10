@@ -209,6 +209,8 @@ public:
     void set_hugetlb(bool v) { use_hugetlb_ = v; }
     void set_uffd(bool v) { use_uffd_ = v; }
     bool use_uffd() const { return use_uffd_; }
+    void set_midway_uffd(bool v) { midway_uffd_ = v; }
+    bool midway_uffd() const { return midway_uffd_; }
     size_t uffd_fault_count() const { return uffd_fault_count_.load(); }
     void set_cmd_start(const struct timespec &ts) { t_cmd_start_ = ts; timing_entrypoint_ = true; }
     void set_vcpu_start(const struct timespec &ts) { t_vcpu_start_ = ts; }
@@ -362,6 +364,7 @@ private:
     std::atomic<bool> uffd_running_{false};
     int uffd_wakeup_fd_ = -1;
     bool use_uffd_ = false;
+    bool midway_uffd_ = false;
     std::atomic<size_t> uffd_fault_count_{0};
 
     // Resident snapshot references for userfaultfd worker

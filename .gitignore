@@ -14,9 +14,9 @@ test_rootfs/
 # Runtime files
 *.sock
 *.o
-*.d
-*.snap
+*.snap*
 *.img
+busybox
 
 # Editor
 *.swp
