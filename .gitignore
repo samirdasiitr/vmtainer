@@ -16,6 +16,7 @@ test_rootfs/
 *.o
 *.d
 *.snap
+*.img
 
 # Editor
 *.swp
