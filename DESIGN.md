@@ -105,9 +105,151 @@ Guest Physical Address Map:
 RAM is backed by a memfd (anonymous shared memory), allowing zero-copy mmap
 into userspace and efficient snapshot restore via sparse copy.
 
-## 3. Snapshot Format
+## 3. Container Image Execution via virtiofs & Entrypoint
 
-### 3.1 Header (v7)
+vmtainer provides standard OCI/Docker container image compatibility without
+running a Docker daemon or container runtime inside the micro-VM. Standard
+container images are unpacked on the host, exposed to the guest VM through a
+dedicated `virtiofsd` daemon, configured via metadata injection files
+(`.entrypoint` and `.vmconfig`), and executed inside an isolated `chroot`
+environment.
+
+### 3.1 Docker / OCI Image Extraction
+
+Container images are pulled and flattened on the host to create a clean root
+filesystem (`rootfs`) for each container:
+
+1. **Pull & Create**: The host runtime (CLI script or CRI plugin) fetches the image using standard tooling:
+   - **CLI (`clone.sh`)**: Runs `docker pull <image>`, then `docker create <image> /bin/true` to create a stopped container instance and extract its image layers and metadata.
+   - **CRI Plugin (`ImageService.PullImage`)**: Pulls the image and persists canonical digests, tags, and layer information in `/var/lib/vmtainer/images/<digest>/`.
+2. **Filesystem Extraction**: The container filesystem is flattened into a host directory:
+   ```bash
+   docker export "$CONTAINER_ID" | tar -xf - -C "$ROOTFS_DIR"
+   ```
+   For CRI containers, `CreateContainer` copies or bind-mounts the cached rootfs into `/var/lib/vmtainer/containers/<container-id>/rootfs`, ensuring each container instance has its own isolated, writable filesystem tree.
+3. **Metadata Inspection**: The default entrypoint and command arguments are parsed from the image manifest (`Config.Entrypoint` and `Config.Cmd` via `docker inspect`, or CRI `Command` and `Args` specifications). If unspecified, it defaults to `/bin/sh`.
+
+### 3.2 Exposing Rootfs via virtiofs & vhost-user
+
+Rather than attaching heavy block devices or formatting virtual disk images,
+vmtainer uses **virtiofs** (virtio-fs) to share the host directory directly with
+the guest at near-native filesystem speed:
+
+```
++--------------------------------------------------------------------+
+| HOST                                                               |
+|                                                                    |
+|  Container Rootfs: /var/lib/vmtainer/containers/<id>/rootfs/       |
+|  +-- bin/, etc/, usr/, ...                                         |
+|  +-- .entrypoint (injected by host)                                |
+|  +-- .vmconfig   (injected by host)                                |
+|        ^                                                           |
+|        | (directory passthrough)                                   |
+|  +-----+------------+                                              |
+|  |    virtiofsd     | (Rust daemon, --sandbox none --cache never)  |
+|  +-----+------------+                                              |
+|        | Unix socket: /tmp/vmtainer-vhost-<pid>.sock               |
+|        v (vhost-user protocol)                                     |
+|  +-----+------------+        KVM memfd                             |
+|  |   vmtainer VMM   | <======================+                     |
+|  +------------------+                        |                     |
++--------|-------------------------------------|---------------------+
+         | virtio-mmio (0xd0001000, IRQ 5)      | (shared guest RAM)
++--------v-------------------------------------v---------------------+
+| GUEST MICRO-VM                                                     |
+|                                                                    |
+|  Linux Kernel (virtio_fs + virtio_mmio driver)                     |
+|        |                                                           |
+|  initrd: /init                                                     |
+|        | mount -t virtiofs myfs /share                             |
+|        v                                                           |
+|  /share (mapped to Host Container Rootfs)                          |
+|        |                                                           |
+|        +--> chroot /share <ENTRYPOINT>                             |
++--------------------------------------------------------------------+
+```
+
+1. **Dedicated virtiofsd per VM**: For each restored micro-VM, the VMM forks an instance of the Rust-based `virtiofsd` daemon:
+   ```bash
+   /usr/libexec/virtiofsd \
+       --socket-path /tmp/vmtainer-vhost-<pid>.sock \
+       --shared-dir <rootfs_dir> \
+       --sandbox none \
+       --cache never
+   ```
+2. **vhost-user IPC**: The VMM connects to the daemon's Unix domain socket and performs the vhost-user protocol handshake.
+3. **Zero-Copy Memory Sharing**: The guest RAM backing descriptor (`memfd`) is passed to `virtiofsd` across the Unix domain socket. This allows `virtiofsd` to directly read requests from guest virtqueues and write file data into guest physical memory without VMM bounce buffering.
+4. **MMIO Virtio Transport**: The VMM exposes virtiofs as a standard virtio-mmio device at base address `0xd0001000` (IRQ 5, Device ID 26).
+
+### 3.3 Configuration Injection (`.entrypoint` and `.vmconfig`)
+
+To keep guest startup fast and eliminate the need for heavy guest agents or extra virtual configuration devices, the host VMM injects configuration files directly into the root of the shared directory before launching the VM:
+
+1. **`.entrypoint`**: Contains the command string to be executed inside the container:
+   ```
+   /bin/sh -c "python3 app.py"
+   ```
+   When configured via CRI or CLI, working directory prefixes are encoded directly (e.g., `cd /app && python3 app.py`).
+2. **`.vmconfig`**: A key-value shell file containing container metadata, networking parameters, and environment variables:
+   ```bash
+   HOSTNAME=web-backend-0
+   NET_IP=10.0.0.2/24
+   NET_GW=10.0.0.1
+   NET_MAC=52:54:00:12:34:56
+   ENV_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+   ENV_PORT=8080
+   ENV_NODE_ENV=production
+   ```
+
+### 3.4 Snapshot Decoupling & Clean FUSE Handshake
+
+The snapshot-restore architecture requires careful coordination with virtiofs:
+
+- **The FUSE Session Dilemma**: A live virtiofs mount involves stateful FUSE session negotiation (`FUSE_INIT`, unique session tokens, open file handles, and daemon queues). If a snapshot were taken *after* mounting virtiofs, restoring into a new `virtiofsd` process with a different root directory would cause stale session handles and I/O panics.
+- **Deterministic Signal Timing**: In vmtainer, the golden snapshot is taken in the guest `init` script **immediately after** kernel drivers are initialized, but **before** `mount -t virtiofs` is called.
+- **Clean Restores**: When `vmtainer restore` is invoked, the VMM launches a fresh `virtiofsd` daemon pointed at the new container's rootfs. When the vCPU resumes execution from the snapshot, the guest `init` executes `mount -t virtiofs myfs /share` against the newly initialized `virtiofsd`, establishing a clean, valid FUSE session every time.
+
+### 3.5 Guest Init Sequence: Mount, Chroot, and Execution
+
+Once restored, the guest `init` process (`PID 1` inside the initrd) executes the container lifecycle:
+
+1. **Mount virtiofs**:
+   ```sh
+   mount -t virtiofs myfs /share
+   ```
+2. **Load Configuration**:
+   - Reads the entrypoint command from `/share/.entrypoint`.
+   - Sources network, hostname, and environment parameters from `/share/.vmconfig`.
+3. **Configure Network & Host**:
+   - Sets the hostname via `/proc/sys/kernel/hostname`.
+   - Brings up `eth0`, assigns `$NET_IP`, and adds the default gateway `$NET_GW`.
+4. **Pseudo-Filesystem Preparation**:
+   Prepares virtual filesystems inside the container rootfs:
+   ```sh
+   mkdir -p /share/proc /share/sys /share/dev /share/tmp
+   mount --move /proc /share/proc || mount -t proc proc /share/proc
+   mount --move /sys  /share/sys  || mount -t sysfs sysfs /share/sys
+   mount --move /dev  /share/dev  || mount -t devtmpfs devtmpfs /share/dev
+   [ -e /share/dev/kmsg ] || mknod /share/dev/kmsg c 1 11
+   ```
+5. **Environment Export**:
+   Iterates through all variables matching `ENV_*` in `.vmconfig` and exports them (e.g., `ENV_PORT=8080` becomes `export PORT=8080`).
+6. **Chroot and Entrypoint Execution**:
+   Switches into the container filesystem and executes the target entrypoint:
+   ```sh
+   chroot /share $ENTRYPOINT
+   RC=$?
+   ```
+7. **Clean VM Halt**:
+   When the entrypoint process exits, `init` logs `entrypoint exited ($RC)` to `/dev/kmsg` and halts the machine:
+   ```sh
+   exec /bin/halt -f
+   ```
+   The kernel halts, KVM traps VM shutdown, and the VMM collects the container exit code and terminates `virtiofsd`.
+
+## 4. Snapshot Format
+
+### 4.1 Header (v7)
 
 The snapshot is a single flat file containing all KVM state needed to restore
 a vCPU + VM to its exact pre-snapshot state.
@@ -143,7 +285,7 @@ Total for default config: ~65 MB (4000B header + 8192B xsave +
   2080B cpuid + 1264B msrs + 2048B bitmap + 64MB RAM)
 ```
 
-### 3.2 Dirty Page Bitmap
+### 4.2 Dirty Page Bitmap
 
 On snapshot save, every 4KB page of guest RAM is scanned with a fast
 64-bit OR-reduce. Non-zero pages are marked in a bitmap (1 bit per page).
@@ -154,7 +296,7 @@ Typical dirty ratio: **~46%** (7458/16384 pages = 29MB of 64MB).
 On restore, only dirty pages are copied, saving both time (skip zero-page
 reads) and physical memory (memfd pages stay zero until written).
 
-## 4. Snapshot Restore Pipeline
+## 5. Snapshot Restore Pipeline
 
 ```
 restore_snapshot_file(path):
@@ -173,9 +315,9 @@ restore_snapshot_file(path):
 Total: ~13 ms (warm cache)
 ```
 
-## 5. Optimization History
+## 6. Optimization History
 
-### 5.1 Timeline
+### 6.1 Timeline
 
 | # | Optimization | Before | After | Speedup |
 |---|-------------|--------|-------|---------|
@@ -187,7 +329,7 @@ Total: ~13 ms (warm cache)
 | 6 | Dirty page bitmap in snapshot | 15ms snap | 12ms | 1.25x |
 | 7 | Drop MAP_POPULATE (lazy faults) | 12ms snap | 12ms | ~same warm |
 
-### 5.2 Current Breakdown (Single VM, Warm Cache)
+### 6.2 Current Breakdown (Single VM, Warm Cache)
 
 ```
 Component           Time (ms)    % of total
@@ -202,16 +344,16 @@ KVM state restore   < 0.5        <4%
 Total               12-17        100%
 ```
 
-### 5.3 Remaining Bottleneck
+### 6.3 Remaining Bottleneck
 
 The dominant cost is **memcpy of ~29MB of dirty pages** from the snapshot
 mmap into the memfd-backed guest RAM. This is ~6ms of pure memory bandwidth
 (verified by the kernel module benchmark below), plus page fault overhead
 when the source pages aren't in the page cache.
 
-## 6. Kernel Module: vmalloc-backed Snapshot
+## 7. Kernel Module: vmalloc-backed Snapshot
 
-### 6.1 Design
+### 7.1 Design
 
 The `vmtainer_snap` kernel module creates `/dev/vmtainer_snap`, a character
 device that allocates vmalloc memory and maps it to userspace. The snapshot
@@ -226,7 +368,7 @@ void *buf = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
 // remap_vmalloc_range() gives zero-copy access
 ```
 
-### 6.2 Benchmark Results
+### 7.2 Benchmark Results
 
 Sparse copy of 29MB (7458 dirty pages) from various source types to a memfd:
 
@@ -246,7 +388,7 @@ provides a **guaranteed warm-cache behavior** (no cold-cache penalty of
 50-110ms), but the same effect can be achieved with `mlock()` or
 `MAP_LOCKED` on a regular file mmap.
 
-### 6.3 Conclusion
+### 7.3 Conclusion
 
 The vmalloc kernel module eliminates cold-cache variance but does not improve
 warm-cache performance. For production use, pre-warming the snapshot via
@@ -254,16 +396,16 @@ warm-cache performance. For production use, pre-warming the snapshot via
 effective. The kmod is useful for **guaranteed latency SLOs** where page cache
 eviction is a concern.
 
-## 7. Parallel Clone Benchmark
+## 8. Parallel Clone Benchmark
 
-### 7.1 Setup
+### 8.1 Setup
 
 - **Hardware**: Intel i5-14500 (14 cores / 20 threads), 40GB DDR5, NVMe SSD
 - **Test**: Launch N VMs simultaneously from golden snapshot
 - **Two modes**: "Restore-only" measures VMM restore time; "Full E2E"
   waits for the guest to finish execution (virtiofs mount + entrypoint + halt)
 
-### 7.2 Restore-Only Results (VMM restore time only)
+### 8.2 Restore-Only Results (VMM restore time only)
 
 Each VM runs `vmtainer restore` with virtiofsd, measures the "restored in"
 time. VMs continue executing until timeout (not part of measurement).
@@ -281,7 +423,7 @@ N      Success    Wall     Restore p50   virtiofsd p50   Snap p50   Throughput
 1000   1000/1000  5.0s     120ms         42.6ms          31ms       199.8 VM/s
 ```
 
-### 7.3 Full E2E Results (guest runs /bin/true and halts)
+### 8.3 Full E2E Results (guest runs /bin/true and halts)
 
 Each VM has its own TAP device, IP address, virtiofsd, and runs `/bin/true`
 inside an Alpine Linux chroot via virtiofs.
@@ -293,7 +435,7 @@ N      Success    Wall     Restore p50   Guest p50   Guest p99    Throughput
 200    200/200    15.1s    164ms         2231ms      15054ms      13.3 VM/s
 ```
 
-### 7.4 Detailed Breakdown at 100 Concurrent VMs (Full E2E)
+### 8.4 Detailed Breakdown at 100 Concurrent VMs (Full E2E)
 
 ```
 Component              Min      Avg      p50      p90      p99      Max
@@ -305,7 +447,7 @@ Total restore (ms)     25.7     83.7     73.4     163.0    298.2    387.3
 Wall time (ms)        1167    1846     1955      2104     2122     2257
 ```
 
-### 7.5 Detailed Breakdown at 1000 Concurrent VMs (Restore-Only)
+### 8.5 Detailed Breakdown at 1000 Concurrent VMs (Restore-Only)
 
 ```
 Component              Min      Avg      p50      p90      p99      Max
@@ -316,7 +458,7 @@ Total restore (ms)     17.4    318.5    120.3     874.2   1325.2   1566.6
   virtiofsd startup     1.3    255.7     42.6     703.9   1241.1   1469.4
 ```
 
-### 7.6 Scaling Analysis
+### 8.6 Scaling Analysis
 
 **virtiofsd is NOT the process-count bottleneck.** Even at 1000 VMs
 (2000 total processes: 1000 vmtainer + 1000 virtiofsd), all VMs restore
@@ -333,7 +475,7 @@ the p99 tail grows to 1.2s due to CPU scheduling contention.
 200+ VMs. At 1000 VMs = 29GB total memcpy, the DDR5 bandwidth (~50GB/s)
 becomes the limiting factor.
 
-### 7.7 Recommendations for Production
+### 8.7 Recommendations for Production
 
 1. **Batch launching**: Start VMs in waves of 50-100 to avoid overwhelming
    the scheduler
@@ -344,7 +486,7 @@ becomes the limiting factor.
 4. **Reduce guest work**: Use a minimal init that skips network config
    when not needed
 
-## 8. Guest Kernel Configuration
+## 9. Guest Kernel Configuration
 
 Minimal Linux 6.10 kernel with only required subsystems:
 
@@ -371,7 +513,7 @@ virtio_mmio.device=0x1000@0xd0001000:5
 virtio_mmio.device=0x1000@0xd0002000:6
 ```
 
-## 9. CRI Plugin Architecture
+## 10. CRI Plugin Architecture
 
 The CRI (Container Runtime Interface) plugin enables Kubernetes to use
 vmtainer as a container runtime.
@@ -392,7 +534,7 @@ kubelet --container-runtime-endpoint=unix:///var/run/vmtainer.sock
     process   process   device  cache
 ```
 
-### 9.1 Pod Sandbox Lifecycle
+### 10.1 Pod Sandbox Lifecycle
 
 ```
 RunPodSandbox    -> allocate TAP + IP, write config.json
@@ -402,7 +544,7 @@ StopPodSandbox   -> SIGTERM vmtainer, cleanup TAP
 RemovePodSandbox -> remove metadata + rootfs
 ```
 
-### 9.2 Key Design Decisions
+### 10.2 Key Design Decisions
 
 - **1:1 pod:VM mapping**: Each pod sandbox is one VM
 - **Image cache**: OCI images extracted to `/var/lib/vmtainer/images/<hash>/rootfs/`
@@ -410,7 +552,7 @@ RemovePodSandbox -> remove metadata + rootfs
 - **Networking**: TAP devices (`vmtap0..N`) with IP from configurable subnet
 - **Exec**: Side-channel via virtiofs (write command JSON, poll for result)
 
-## 10. Debug Logging
+## 11. Debug Logging
 
 Debug output is available via the `--debug` flag. When enabled, the VMM
 emits detailed trace information to stderr with `[DBG]` prefix:
@@ -442,16 +584,16 @@ Logged events:
 - Virtio device status transitions
 - Net thread lifecycle
 
-## 11. Future Work
+## 12. Future Work
 
-### 11.1 Demand-Paged Restore (userfaultfd)
+### 12.1 Demand-Paged Restore (userfaultfd)
 
 Register the guest RAM memfd with userfaultfd and handle page faults lazily
 from the snapshot. This would reduce restore time to near-zero (only the
 pages actually touched by the guest during early boot would be copied).
 Expected benefit: **0ms initial restore** + ~0.05ms per page fault.
 
-### 11.2 Pre-fork with COW
+### 12.2 Pre-fork with COW
 
 For the `clone` command, load the golden snapshot in a parent process and
 `fork()` for each clone. The forked child inherits the parent's RAM via
@@ -459,20 +601,20 @@ COW (copy-on-write) page tables, avoiding the 29MB memcpy entirely.
 The child then creates its own KVM VM and maps the inherited RAM.
 Expected benefit: **~2ms restore** (KVM init + virtiofsd only, no memcpy).
 
-### 11.3 Compressed Snapshots
+### 12.3 Compressed Snapshots
 
 Store only dirty pages in the snapshot file (skip zero pages entirely).
 Would reduce file size from 65MB to ~30MB, improving cold-cache restore.
 Could also apply LZ4 compression for further reduction.
 
-### 11.4 Huge Pages (2MB)
+### 12.4 Huge Pages (2MB)
 
 Using 2MB huge pages for guest RAM would:
 - Reduce TLB misses during memcpy (16 TLB entries vs 7458)
 - Reduce page fault count during restore
 - Improve guest execution performance
 
-### 11.5 vhost-net Kernel Data Path
+### 12.5 vhost-net Kernel Data Path
 
 Currently virtio-net uses a userspace packet forwarding thread. Switching
 to the kernel vhost-net data path (`/dev/vhost-net`) would:
@@ -480,7 +622,7 @@ to the kernel vhost-net data path (`/dev/vhost-net`) would:
 - Reduce network latency
 - Free one CPU thread per VM
 
-## 12. File Inventory
+## 13. File Inventory
 
 ```
 src/vmm.cpp                    VMM implementation (C++17, ~2740 LOC)

@@ -287,6 +287,8 @@ private:
     int        tap_fd_           = -1;
     int        vhost_fd_         = -1;  // /dev/vhost-net fd (unused in userspace mode)
     int        net_wakeup_fd_    = -1;  // wakeup eventfd for net thread
+    pthread_t  net_thread_       = 0;
+    bool       net_thread_running_ = false;
     volatile bool net_thread_stop_ = false;
 
     // IRQ thread: monitors call_fds and interrupts KVM_RUN

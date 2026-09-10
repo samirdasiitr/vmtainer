@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT=/home/sadas/vmtainer
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD=$ROOT/build/kernel
 SRC=$BUILD/linux
 OUT=$ROOT/images

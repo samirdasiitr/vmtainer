@@ -9,8 +9,10 @@ set -euo pipefail
 
 COUNT=${1:-100}
 MODE=${2:-full}
-VMTAINER=/home/sadas/vmtainer/build/vmm/vmtainer
-GOLDEN=/home/sadas/vmtainer/images/golden.snap
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VMTAINER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+VMTAINER=$VMTAINER_DIR/build/vmm/vmtainer
+GOLDEN=$VMTAINER_DIR/images/golden.snap
 RESULTS_DIR=/tmp/vmtainer-restonly-$$
 ROOTFS=/tmp/vmtainer-nginx-rootfs
 

@@ -230,7 +230,7 @@ void *Vmm::irq_thread_func(void *arg) {
         fds[nfds].revents = 0;
         nfds++;
 
-        int ret = poll(fds, nfds, 500); // 500ms timeout
+        int ret = poll(fds, nfds, 10); // 10ms timeout (allows rapid HLT detection)
 
         // Check wakeup fd (shutdown signal)
         if (ret > 0 && fds[nfds - 1].revents & POLLIN) {
@@ -700,9 +700,8 @@ bool Vmm::vhost_net_setup() {
 
     net_wakeup_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
-    pthread_t net_thread;
-    pthread_create(&net_thread, nullptr, net_thread_func, this);
-    pthread_detach(net_thread);
+    pthread_create(&net_thread_, nullptr, net_thread_func, this);
+    net_thread_running_ = true;
 
     printf("[VMM] virtio-net: userspace data path active\n");
     return true;

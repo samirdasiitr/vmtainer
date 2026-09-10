@@ -323,7 +323,12 @@ int Vmm::run() {
                 struct kvm_regs regs;
                 ioctl(vcpu_fd_, KVM_GET_REGS, &regs);
                 if (!(regs.rflags & 0x200)) {
-                    if (++consecutive_hlt_eintr >= 3)
+                    struct kvm_mp_state mp = {};
+                    if (ioctl(vcpu_fd_, KVM_GET_MP_STATE, &mp) == 0 &&
+                        mp.mp_state == KVM_MP_STATE_HALTED) {
+                        return 0;
+                    }
+                    if (++consecutive_hlt_eintr >= 2)
                         return 0;
                 } else {
                     consecutive_hlt_eintr = 0;
@@ -843,8 +848,12 @@ void Vmm::cleanup() {
         uint64_t one = 1;
         ssize_t nw = ::write(net_wakeup_fd_, &one, sizeof(one));
         (void)nw;
-        usleep(50000);
+        if (net_thread_running_) {
+            pthread_join(net_thread_, nullptr);
+            net_thread_running_ = false;
+        }
         close(net_wakeup_fd_);
+        net_wakeup_fd_ = -1;
     }
     if (vhost_fd_ >= 0) close(vhost_fd_);
     if (tap_fd_ >= 0) close(tap_fd_);

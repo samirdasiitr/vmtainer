@@ -92,13 +92,22 @@ fi
 log "VMTAINER: chroot into virtiofs, entrypoint=$ENTRYPOINT"
 
 # Set up pseudo-filesystems inside the new root
-mkdir -p /share/proc /share/sys /share/dev /share/tmp
-mount --move /proc /share/proc 2>/dev/null || mount -t proc proc /share/proc
-mount --move /sys  /share/sys  2>/dev/null || mount -t sysfs sysfs /share/sys
-mount --move /dev  /share/dev  2>/dev/null || mount -t devtmpfs devtmpfs /share/dev
+mkdir -p /share/proc /share/sys /share/dev /share/tmp /share/dev/pts /share/dev/shm
+mount -t proc     proc     /share/proc 2>/dev/null || mount --bind /proc /share/proc 2>/dev/null || true
+mount -t sysfs    sysfs    /share/sys  2>/dev/null || mount --bind /sys  /share/sys  2>/dev/null || true
+mount -t devtmpfs devtmpfs /share/dev  2>/dev/null || mount --bind /dev  /share/dev  2>/dev/null || true
+mount -t devpts   devpts   /share/dev/pts 2>/dev/null || true
 
-# Create /dev/kmsg if missing
-[ -e /share/dev/kmsg ] || mknod /share/dev/kmsg c 1 11 2>/dev/null
+# Ensure essential device nodes exist and are accessible inside rootfs
+[ -e /share/dev/null ]    || mknod /share/dev/null c 1 3 2>/dev/null || true
+[ -e /share/dev/zero ]    || mknod /share/dev/zero c 1 5 2>/dev/null || true
+[ -e /share/dev/console ] || mknod /share/dev/console c 5 1 2>/dev/null || true
+[ -e /share/dev/tty ]     || mknod /share/dev/tty c 5 0 2>/dev/null || true
+[ -e /share/dev/ttyS0 ]   || mknod /share/dev/ttyS0 c 4 64 2>/dev/null || true
+[ -e /share/dev/kmsg ]    || mknod /share/dev/kmsg c 1 11 2>/dev/null || true
+[ -e /share/dev/urandom ] || mknod /share/dev/urandom c 1 9 2>/dev/null || true
+
+chmod 666 /share/dev/null /share/dev/zero /share/dev/console /share/dev/tty /share/dev/ttyS0 /share/dev/urandom 2>/dev/null || true
 
 # Export env vars from config
 for v in $(set | grep '^ENV_' | sed 's/=.*//'); do
@@ -110,8 +119,19 @@ done
 
 # Run the entrypoint inside the chroot as a subprocess.
 # When it finishes, we (init / PID 1) do the halt.
-log "VMTAINER: running entrypoint"
-chroot /share $ENTRYPOINT
-RC=$?
+log "VMTAINER: running entrypoint: $ENTRYPOINT"
+
+# Execute through container's shell if available so quotes, pipes, flags, and builtins work.
+# Fallback to direct chroot execution if no shell is found (e.g. distroless images).
+if chroot /share /bin/sh -c "exec $ENTRYPOINT"; then
+    RC=0
+else
+    RC=$?
+    if [ $RC -eq 127 ]; then
+        eval chroot /share "$ENTRYPOINT"
+        RC=$?
+    fi
+fi
+
 log "VMTAINER: entrypoint exited ($RC)"
 exec /bin/halt -f

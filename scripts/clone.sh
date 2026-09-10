@@ -3,7 +3,8 @@
 # Usage: sudo ./vmtainer_clone.sh <image> [--cmd <command>] [--ip <ip/mask>] [--gw <gateway>] [--name <hostname>]
 set -euo pipefail
 
-VMTAINER_DIR=/home/sadas/vmtainer
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VMTAINER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GOLDEN_SNAP=$VMTAINER_DIR/images/golden.snap
 VMTAINER_BIN=$VMTAINER_DIR/build/vmm/vmtainer
 CLONE_BASE=/tmp/vmtainer-clones
