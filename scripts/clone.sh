@@ -1,4 +1,12 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# Unauthorized copying, reproduction, distribution, or modification of this
+# file, via any medium, is strictly prohibited.
+# All rights reserved.
+
 # vmtainer_clone.sh -- pull an OCI image, extract rootfs, and run in a VM
 # Usage: sudo ./vmtainer_clone.sh <image> [--cmd <command>] [--ip <ip/mask>] [--gw <gateway>] [--name <hostname>]
 set -euo pipefail

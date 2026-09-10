@@ -1,3 +1,12 @@
+<!--
+Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+
+PROPRIETARY AND CONFIDENTIAL.
+Unauthorized copying, reproduction, distribution, or modification of this
+file, via any medium, is strictly prohibited.
+All rights reserved.
+-->
+
 # 02 — KVM Basics: /dev/kvm, VM and vCPU Lifecycle, kvm_run
 
 ## 1. Opening the KVM Subsystem

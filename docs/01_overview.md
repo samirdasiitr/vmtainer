@@ -1,3 +1,12 @@
+<!--
+Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+
+PROPRIETARY AND CONFIDENTIAL.
+Unauthorized copying, reproduction, distribution, or modification of this
+file, via any medium, is strictly prohibited.
+All rights reserved.
+-->
+
 # 01 — Overview: Building a Virtual Machine Monitor with KVM
 
 ## 1. What is a VMM?

@@ -1,4 +1,12 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# Unauthorized copying, reproduction, distribution, or modification of this
+# file, via any medium, is strictly prohibited.
+# All rights reserved.
+
 # bench_e2e.sh -- Full end-to-end benchmark: TAP + virtiofsd + network + entrypoint
 # Usage: sudo ./bench_e2e.sh [count]
 set -euo pipefail

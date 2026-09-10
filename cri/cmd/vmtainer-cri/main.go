@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL.
+ * Unauthorized copying, reproduction, distribution, or modification of this
+ * file, via any medium, is strictly prohibited.
+ * All rights reserved.
+ */
+
 // vmtainer-cri is a Kubernetes CRI v1 runtime shim that drives the vmtainer
 // KVM micro-VM runtime via gRPC.
 //

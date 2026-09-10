@@ -1,3 +1,12 @@
+<!--
+Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+
+PROPRIETARY AND CONFIDENTIAL.
+Unauthorized copying, reproduction, distribution, or modification of this
+file, via any medium, is strictly prohibited.
+All rights reserved.
+-->
+
 # Interrupt Injection in a KVM VMM
 
 Delivering interrupts to a virtual machine is one of the most performance-sensitive jobs of a VMM. KVM offers several injection paths, from the simple legacy 8259A Programmable Interrupt Controller (PIC), through the local APIC used by multi-processor guests, to MSI/MSI-X message-signalled interrupts and eventfd-based fast paths. This document explains each mechanism and gives code-level examples.

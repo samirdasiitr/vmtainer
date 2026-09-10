@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL.
+ * Unauthorized copying, reproduction, distribution, or modification of this
+ * file, via any medium, is strictly prohibited.
+ * All rights reserved.
+ */
+
 // This file contains the RuntimeService implementation for vmtainer-cri.
 // Each pod sandbox maps to exactly one vmtainer VM process.  Containers inside
 // a sandbox are therefore 1:1 with the sandbox; CreateContainer records the

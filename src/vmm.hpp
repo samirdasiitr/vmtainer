@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL.
+ * Unauthorized copying, reproduction, distribution, or modification of this
+ * file, via any medium, is strictly prohibited.
+ * All rights reserved.
+ */
+
 #pragma once
 
 #include <atomic>
@@ -352,7 +361,7 @@ private:
     pthread_t uffd_thread_ = 0;
     std::atomic<bool> uffd_running_{false};
     int uffd_wakeup_fd_ = -1;
-    bool use_uffd_ = true;
+    bool use_uffd_ = false;
     std::atomic<size_t> uffd_fault_count_{0};
 
     // Resident snapshot references for userfaultfd worker

@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL.
+ * Unauthorized copying, reproduction, distribution, or modification of this
+ * file, via any medium, is strictly prohibited.
+ * All rights reserved.
+ */
+
 // Package network handles TAP device creation, IP address allocation, and
 // optional CNI-based network setup for vmtainer sandboxes.
 //

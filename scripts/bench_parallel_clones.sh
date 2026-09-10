@@ -1,4 +1,12 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# Unauthorized copying, reproduction, distribution, or modification of this
+# file, via any medium, is strictly prohibited.
+# All rights reserved.
+
 # bench_parallel_clones.sh -- Benchmark N parallel VM clones from golden snapshot
 # Usage: sudo ./bench_parallel_clones.sh [count] [rootfs_path]
 set -euo pipefail

@@ -1,4 +1,12 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# Unauthorized copying, reproduction, distribution, or modification of this
+# file, via any medium, is strictly prohibited.
+# All rights reserved.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -79,8 +87,11 @@ mknod "$INITRD/dev/tty" c 5 0 2>/dev/null || true
 mknod "$INITRD/dev/kmsg" c 1 11 2>/dev/null || true
 mknod "$INITRD/dev/mem" c 1 1 2>/dev/null || true
 
-# Copy init from source
-if [ -f "$INIT_SRC" ]; then
+# Build init (prefer static C binary, fallback to shell script)
+if [ -f "$ROOT/initrd_src/init.c" ]; then
+    echo "[build_initrd] compiling static C init from initrd_src/init.c..."
+    gcc -O2 -static -Wall -Wextra -s -o "$INITRD/init" "$ROOT/initrd_src/init.c"
+elif [ -f "$INIT_SRC" ]; then
     cp "$INIT_SRC" "$INITRD/init"
 else
     cp "$ROOT/initrd/init" "$INITRD/init" 2>/dev/null || true

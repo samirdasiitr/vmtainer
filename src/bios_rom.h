@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL.
+ * Unauthorized copying, reproduction, distribution, or modification of this
+ * file, via any medium, is strictly prohibited.
+ * All rights reserved.
+ */
+
 static const unsigned char bios_rom[] = {
   0x66, 0x57, 0x66, 0x56, 0x66, 0x53, 0x66, 0x89, 0xc3, 0x66, 0x89, 0xc8,
   0x67, 0x66, 0x8b, 0x4c, 0x24, 0x14, 0x67, 0x66, 0x8b, 0x74, 0x24, 0x10,

@@ -1,4 +1,12 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL.
+# Unauthorized copying, reproduction, distribution, or modification of this
+# file, via any medium, is strictly prohibited.
+# All rights reserved.
+
 # bench_restore_only.sh -- Benchmark N parallel VM restores
 # Measures ONLY the VMM restore time (KVM init + snapshot copy + virtiofsd).
 # Kills the VM immediately after restore completes (doesn't wait for guest).

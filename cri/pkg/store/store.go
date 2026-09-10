@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL.
+ * Unauthorized copying, reproduction, distribution, or modification of this
+ * file, via any medium, is strictly prohibited.
+ * All rights reserved.
+ */
+
 // Package store provides a JSON-file-backed metadata store for vmtainer-cri
 // sandboxes and containers. Each object gets its own subdirectory under the
 // base data dir so concurrent reads never block on a global lock beyond a

@@ -1,4 +1,13 @@
 /*
+ * Copyright (c) 2026 Samir Das <samiruor@gmail.com>. All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL.
+ * Unauthorized copying, reproduction, distribution, or modification of this
+ * file, via any medium, is strictly prohibited.
+ * All rights reserved.
+ */
+
+/*
  * acpi.c
  *
  * Constructs minimal ACPI tables in guest memory.  The goal is to show how
