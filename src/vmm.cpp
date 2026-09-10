@@ -75,6 +75,11 @@ bool Vmm::init(bool zero_ram) {
     if (zero_ram) memset(ram_, 0, ram_bytes_);
     DBG("init: ram=%p memfd=%d size=%zuMB hugetlb=%d", ram_, ram_memfd_, ram_bytes_ >> 20, use_hugetlb_);
 
+    if (use_uffd_ && !init_uffd()) {
+        DBG("init: userfaultfd init failed, falling back to memcpy restore");
+        use_uffd_ = false;
+    }
+
     if (!set_memslot(0, 0, ram_, ram_bytes_)) return false;
 
     vcpu_fd_ = ioctl(vm_fd_, KVM_CREATE_VCPU, 0);
@@ -290,8 +295,12 @@ void Vmm::serial_out(uint16_t port, uint8_t data) {
     switch (port) {
     case 0x3f8:
         if (dlab) { uart_dll_ = data; break; }
-        putchar(data);
         if (data == '\n') {
+            if (timing_entrypoint_ && serial_line_buf_.rfind("VMTAINER:", 0) == 0) {
+                printf("[+%6.2fms] %s\n", ms_since_start(), serial_line_buf_.c_str());
+            } else {
+                printf("%s\n", serial_line_buf_.c_str());
+            }
             fflush(stdout);
             if (timing_entrypoint_ && !entrypoint_measured_) {
                 if (serial_line_buf_.find("VMTAINER: running entrypoint") != std::string::npos) {
@@ -314,7 +323,7 @@ void Vmm::serial_out(uint16_t port, uint8_t data) {
                 }
             }
             serial_line_buf_.clear();
-        } else if (serial_line_buf_.size() < 256) {
+        } else if (serial_line_buf_.size() < 1024) {
             serial_line_buf_ += (char)data;
         }
         {
@@ -447,7 +456,12 @@ int Vmm::run() {
             return -1;
 
         case KVM_EXIT_INTERNAL_ERROR:
-            fprintf(stderr, "INTERNAL_ERROR: %u\n", kvm_run_->internal.suberror);
+            fprintf(stderr, "INTERNAL_ERROR: suberror=%u ndata=%u\n",
+                    kvm_run_->internal.suberror, kvm_run_->internal.ndata);
+            for (uint32_t di = 0; di < kvm_run_->internal.ndata; di++) {
+                fprintf(stderr, "  data[%u] = 0x%llx\n", di,
+                        (unsigned long long)kvm_run_->internal.data[di]);
+            }
             return -1;
 
         default:
@@ -554,6 +568,136 @@ bool Vmm::save_snapshot(Snapshot &snap) {
 }
 
 // ---------------------------------------------------------------------------
+// userfaultfd Demand-Paged Restore
+// ---------------------------------------------------------------------------
+
+bool Vmm::init_uffd() {
+    uffd_ = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+    if (uffd_ < 0) {
+        DBG("init_uffd: userfaultfd syscall failed: %s", strerror(errno));
+        return false;
+    }
+
+    struct uffdio_api api = {};
+    api.api = UFFD_API;
+    api.features = 0;
+    if (ioctl(uffd_, UFFDIO_API, &api) < 0) {
+        DBG("init_uffd: UFFDIO_API failed: %s", strerror(errno));
+        close(uffd_);
+        uffd_ = -1;
+        return false;
+    }
+
+    struct uffdio_register reg = {};
+    reg.range.start = (uint64_t)ram_;
+    reg.range.len = ram_bytes_;
+    reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+    if (ioctl(uffd_, UFFDIO_REGISTER, &reg) < 0) {
+        DBG("init_uffd: UFFDIO_REGISTER failed: %s", strerror(errno));
+        close(uffd_);
+        uffd_ = -1;
+        return false;
+    }
+
+    uffd_wakeup_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    DBG("init_uffd: registered userfaultfd on [%p, %p) sz=%zuMB",
+        ram_, (char*)ram_ + ram_bytes_, ram_bytes_ >> 20);
+    return true;
+}
+
+void Vmm::start_uffd_thread() {
+    if (uffd_ < 0 || uffd_running_.load()) return;
+    uffd_running_.store(true);
+    pthread_create(&uffd_thread_, nullptr, uffd_worker_func, this);
+}
+
+void *Vmm::uffd_worker_func(void *arg) {
+    auto *vmm = (Vmm *)arg;
+    vmm->uffd_worker();
+    return nullptr;
+}
+
+void Vmm::uffd_worker() {
+    struct pollfd pfds[2];
+    pfds[0].fd = uffd_;
+    pfds[0].events = POLLIN;
+    pfds[1].fd = uffd_wakeup_fd_;
+    pfds[1].events = POLLIN;
+
+    constexpr size_t PAGE = 4096;
+    size_t total_faults = 0;
+
+    while (uffd_running_.load(std::memory_order_relaxed)) {
+        int pr = poll(pfds, 2, -1);
+        if (pr <= 0) {
+            if (pr < 0 && errno == EINTR) continue;
+            break;
+        }
+
+        if (pfds[1].revents & POLLIN) {
+            break;
+        }
+
+        if (!(pfds[0].revents & POLLIN)) continue;
+
+        struct uffd_msg msg;
+        ssize_t n = read(uffd_, &msg, sizeof(msg));
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            break;
+        }
+
+        if (msg.event == UFFD_EVENT_PAGEFAULT) {
+            uint64_t fault_addr = msg.arg.pagefault.address & ~(PAGE - 1);
+            if (fault_addr < (uint64_t)ram_ || fault_addr >= (uint64_t)ram_ + ram_bytes_) {
+                fprintf(stderr, "[UFFD] fault out of bounds: 0x%lx\n", (unsigned long)fault_addr);
+                continue;
+            }
+
+            uint64_t offset = fault_addr - (uint64_t)ram_;
+            size_t page_idx = offset / PAGE;
+
+            bool is_dirty = false;
+            if (!snap_bitmap_buf_.empty() && page_idx < snap_total_pages_) {
+                if (snap_bitmap_buf_[page_idx / 8] & (1 << (page_idx & 7))) {
+                    is_dirty = true;
+                }
+            }
+
+            if (is_dirty && snap_ram_) {
+                struct uffdio_copy copy = {};
+                copy.src = (uint64_t)(snap_ram_ + offset);
+                copy.dst = fault_addr;
+                copy.len = PAGE;
+                copy.mode = 0;
+                copy.copy = 0;
+                while (ioctl(uffd_, UFFDIO_COPY, &copy) < 0) {
+                    if (errno == EAGAIN) continue;
+                    if (errno != EEXIST) perror("UFFDIO_COPY");
+                    break;
+                }
+                total_faults++;
+            } else {
+                struct uffdio_zeropage zero = {};
+                zero.range.start = fault_addr;
+                zero.range.len = PAGE;
+                zero.mode = 0;
+                while (ioctl(uffd_, UFFDIO_ZEROPAGE, &zero) < 0) {
+                    if (errno == EAGAIN) continue;
+                    if (errno != EEXIST) perror("UFFDIO_ZEROPAGE");
+                    break;
+                }
+                total_faults++;
+            }
+        }
+    }
+
+    uffd_fault_count_.store(total_faults, std::memory_order_relaxed);
+    DBG("uffd_worker: finished, handled %zu page faults (%zu KB)",
+        total_faults, total_faults * 4);
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot -- restore (from in-memory Snapshot)
 // ---------------------------------------------------------------------------
 
@@ -569,8 +713,62 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
     struct timespec ts0, ts1, ts2;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
 
-    // Restore guest RAM -- sparse copy (skip zero pages).
-    {
+    // Restore guest RAM
+    if (use_uffd_ && uffd_ >= 0) {
+        if (!snap_ram_) {
+            snap_ram_ = (const uint8_t *)snap.ram;
+            snap_bitmap_buf_ = snap.dirty_bitmap;
+            snap_total_pages_ = ram_bytes_ / 4096;
+        }
+
+        constexpr size_t PAGE = 4096;
+        size_t total_pages = ram_bytes_ / PAGE;
+        const uint8_t *src = snap_ram_;
+
+        auto prefault_gpa = [&](uint64_t gpa) {
+            if (gpa == 0 || gpa >= ram_bytes_) return;
+            uint64_t fault_addr = ((uint64_t)ram_ + gpa) & ~(PAGE - 1);
+            uint64_t offset = fault_addr - (uint64_t)ram_;
+            size_t page_idx = offset / PAGE;
+            bool is_dirty = false;
+            if (!snap_bitmap_buf_.empty() && page_idx < total_pages) {
+                if (snap_bitmap_buf_[page_idx / 8] & (1 << (page_idx & 7)))
+                    is_dirty = true;
+            }
+            if (is_dirty && src) {
+                struct uffdio_copy copy = {};
+                copy.src = (uint64_t)(src + offset);
+                copy.dst = fault_addr;
+                copy.len = PAGE;
+                ioctl(uffd_, UFFDIO_COPY, &copy);
+            } else {
+                struct uffdio_zeropage zero = {};
+                zero.range.start = fault_addr;
+                zero.range.len = PAGE;
+                ioctl(uffd_, UFFDIO_ZEROPAGE, &zero);
+            }
+        };
+
+        // Pre-fault virtqueue rings for virtio-fs
+        for (uint32_t i = 0; i < NUM_QUEUES && i < h.num_vqs; i++) {
+            if (h.vq_state[i].num > 0) {
+                prefault_gpa(h.vq_state[i].desc);
+                prefault_gpa(h.vq_state[i].driver);
+                prefault_gpa(h.vq_state[i].device);
+            }
+        }
+        // Pre-fault virtqueue rings for virtio-net
+        for (uint32_t i = 0; i < NET_NUM_QUEUES && i < h.net_num_vqs; i++) {
+            if (h.net_vq_state[i].num > 0) {
+                prefault_gpa(h.net_vq_state[i].desc);
+                prefault_gpa(h.net_vq_state[i].driver);
+                prefault_gpa(h.net_vq_state[i].device);
+            }
+        }
+
+        start_uffd_thread();
+        DBG("restore: uffd demand-paged restore active (rings pre-faulted)");
+    } else {
         constexpr size_t PAGE = 4096;
         const uint8_t *src = (const uint8_t *)snap.ram;
         uint8_t *dst = (uint8_t *)ram_;
@@ -846,8 +1044,13 @@ bool Vmm::restore_snapshot_file(const char *path) {
     snap.ram_size = snap.hdr.ram_mb * 1024ULL * 1024;
     if (remain < snap.ram_size) { munmap(map, st.st_size); close(fd); return false; }
     snap.ram = (void *)p;
-    madvise((void *)p, snap.ram_size, MADV_WILLNEED);
-    if (ram_) madvise(ram_, ram_bytes_, MADV_WILLNEED);
+
+    snap_mmap_base_ = map;
+    snap_mmap_sz_ = st.st_size;
+    snap_fd_ = fd;
+    snap_ram_ = (const uint8_t *)p;
+    snap_bitmap_buf_ = snap.dirty_bitmap;
+    snap_total_pages_ = snap.ram_size / 4096;
 
     clock_gettime(CLOCK_MONOTONIC, &tf2);
 
@@ -866,8 +1069,13 @@ bool Vmm::restore_snapshot_file(const char *path) {
 
     snap.ram = nullptr;
     snap.ram_size = 0;
-    munmap(map, st.st_size);
-    close(fd);
+    if (!use_uffd_ || uffd_ < 0) {
+        munmap(map, st.st_size);
+        close(fd);
+        snap_mmap_base_ = nullptr;
+        snap_mmap_sz_ = 0;
+        snap_fd_ = -1;
+    }
     return ok;
 }
 
@@ -905,6 +1113,29 @@ void Vmm::cleanup() {
         pthread_join(irq_thread_, nullptr);
     }
     if (irq_wakeup_fd_ >= 0) close(irq_wakeup_fd_);
+
+    if (uffd_running_.load()) {
+        uffd_running_.store(false);
+        if (uffd_wakeup_fd_ >= 0) {
+            uint64_t one = 1;
+            ssize_t nw = ::write(uffd_wakeup_fd_, &one, sizeof(one));
+            (void)nw;
+        }
+        pthread_join(uffd_thread_, nullptr);
+        uffd_thread_ = 0;
+    }
+    if (uffd_wakeup_fd_ >= 0) { close(uffd_wakeup_fd_); uffd_wakeup_fd_ = -1; }
+    if (uffd_ >= 0) { close(uffd_); uffd_ = -1; }
+
+    if (snap_mmap_base_ && snap_mmap_sz_ > 0) {
+        munmap(snap_mmap_base_, snap_mmap_sz_);
+        snap_mmap_base_ = nullptr;
+        snap_mmap_sz_ = 0;
+    }
+    if (snap_fd_ >= 0) {
+        close(snap_fd_);
+        snap_fd_ = -1;
+    }
 
     if (kvm_run_) munmap(kvm_run_, run_mmap_sz_);
     if (vcpu_fd_ >= 0) close(vcpu_fd_);
@@ -1235,6 +1466,8 @@ int main(int argc, char **argv) {
         vmm.set_cmd_start(t0);
         if (ct_str) vmm.set_copy_threads(atoi(ct_str));
         if (has_flag(argc, argv, "--hugetlb")) vmm.set_hugetlb(true);
+        if (has_flag(argc, argv, "--no-uffd")) vmm.set_uffd(false);
+        else vmm.set_uffd(true);
         if (!vmm.init(false)) return 1;
         long us_init = us_since(t0);
 
@@ -1258,12 +1491,15 @@ int main(int argc, char **argv) {
         if (!vmm.restore_snapshot_file(snap_path)) return 1;
         long us_snap = us_since(t0) - us_setup;
 
-        printf("[VMM] restored in %.1fms  kvm_init=%.1fms virtiofsd=%.1fms tap=%.1fms snap=%.1fms\n",
+        if (vmm.timing_entrypoint())
+            printf("[+%6.2fms] ", vmm.ms_since_start());
+        printf("[VMM] restored in %.1fms  kvm_init=%.1fms virtiofsd=%.1fms tap=%.1fms snap=%.1fms (uffd=%d)\n",
                us_since(t0) / 1000.0,
                us_init / 1000.0,
                us_virtiofsd / 1000.0,
                (us_setup - us_init - us_virtiofsd) / 1000.0,
-               us_snap / 1000.0);
+               us_snap / 1000.0,
+               vmm.use_uffd() ? 1 : 0);
 
         struct timespec t_run;
         clock_gettime(CLOCK_MONOTONIC, &t_run);

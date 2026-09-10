@@ -328,28 +328,92 @@ Total: ~13 ms (warm cache)
 | 5 | Sparse copy (skip zero pages) | 25ms snap | 15ms | 1.7x |
 | 6 | Dirty page bitmap in snapshot | 15ms snap | 12ms | 1.25x |
 | 7 | Drop MAP_POPULATE (lazy faults) | 12ms snap | 12ms | ~same warm |
+| 8 | Multi-thread dynamic coalesced memcpy | 12ms snap | 7.6ms | 1.6x |
+| 9 | userfaultfd demand-paged lazy restore | 7.6ms snap | 0.3ms | 25x (2.7ms total) |
 
 ### 6.2 Current Breakdown (Single VM, Warm Cache)
 
+#### userfaultfd Demand-Paged Mode (Default)
 ```
 Component           Time (ms)    % of total
 ---------           ---------    ----------
-KVM init            0.3-0.8      5%
-virtiofsd startup   1.2-1.6      12%
-TAP connect         0.1          1%
-RAM sparse copy     10-14        82%
-  (29MB dirty pages)
-KVM state restore   < 0.5        <4%
+KVM init            0.6          22%
+virtiofsd startup   1.6          59%
+TAP connect         0.2          7%
+Snapshot RAM setup  0.3          11%
+  (uffd registration + ring pre-fault)
+KVM state restore   < 0.1        <1%
 ---------           ---------    ----------
-Total               12-17        100%
+Total VMM restore   ~2.7         100%
 ```
 
-### 6.3 Remaining Bottleneck
+#### Memcpy Fallback Mode (--no-uffd)
+```
+Component           Time (ms)    % of total
+---------           ---------    ----------
+KVM init            0.6-1.0      6%
+virtiofsd startup   1.2-1.6      12%
+TAP connect         0.2          1%
+RAM sparse copy     7.6-9.8      80%
+  (29MB dirty pages)
+KVM state restore   < 0.1        <1%
+---------           ---------    ----------
+Total VMM restore   10-12        100%
+```
 
-The dominant cost is **memcpy of ~29MB of dirty pages** from the snapshot
-mmap into the memfd-backed guest RAM. This is ~6ms of pure memory bandwidth
-(verified by the kernel module benchmark below), plus page fault overhead
-when the source pages aren't in the page cache.
+### 6.3 Remaining Bottleneck & Optimization Analysis
+
+With `userfaultfd`, the VMM snapshot restore bottleneck was eliminated, reducing restore time
+from 12-17ms down to **2.1-3.4ms**.
+
+The remaining latency is in the **guest initialization phase (virtiofs mount + chroot)**,
+which takes ~28ms inside the 1-vCPU guest kernel.
+
+### 6.4 End-to-End Timestamped Clone Execution Trace
+
+Below is a real execution trace of `scripts/clone.sh` launching an Alpine container clone,
+with microsecond-precision timestamps relative to the VMM process start (`t0 = 0.00ms`):
+
+```
+=== vmtainer clone ===
+  Image:     alpine:latest
+  Clone ID:  clone-1789027341-85129
+  Rootfs:    /tmp/alpine-rootfs
+
+[1/4] Using pre-extracted rootfs (skipped pull & extract)
+[3/4] Preparing config...
+[4/4] Restoring VM from snapshot...
+[+  0.64ms] [VMM] started virtiofsd (pid 85141) sharing /tmp/alpine-rootfs
+[+  2.19ms] [VMM] virtiofs connected, tag='myfs'
+[+  2.20ms] [VMM] virtio-net: mac=52:54:00:12:34:56 (restore)
+[+  2.40ms] [VMM] TAP connected: tap0
+[+  2.65ms] [VMM] virtio-net: userspace data path active
+[+  2.66ms] [VMM] restored in 2.7ms  kvm_init=0.6ms virtiofsd=1.6ms tap=0.2ms snap=0.3ms (uffd=1)
+[+  9.82ms] VMTAINER: mounting virtiofs
+[+ 15.66ms] VMTAINER: virtiofs mounted OK
+[+ 18.98ms] VMTAINER: reading config
+[+ 21.65ms] VMTAINER: hostname=vmtainer
+[+ 26.92ms] VMTAINER: chroot into virtiofs, entrypoint=echo hello
+[+ 30.76ms] VMTAINER: running entrypoint: echo hello
+
+[VMM] ====================================================
+[VMM] TIME TO START OF ENTRYPOINT EXECUTION: 30.77ms
+[VMM]   - VMM setup & snapshot restore:        2.67ms
+[VMM]   - Guest mount & init to entrypoint:    28.10ms
+[VMM] ====================================================
+
+[+ 36.40ms] VMTAINER: entrypoint exited (0)
+hello
+reboot: System halted
+
+=== Clone complete ===
+  Pull+extract:       0ms
+  Snapshot restore:   2.7ms
+  Time to entrypoint: 30.77ms
+  Total VM runtime:   99ms
+  Total E2E time:     99ms
+  Exit code:          0
+```
 
 ## 7. Kernel Module: vmalloc-backed Snapshot
 
@@ -586,12 +650,14 @@ Logged events:
 
 ## 12. Future Work
 
-### 12.1 Demand-Paged Restore (userfaultfd)
+### 12.1 Demand-Paged Restore (userfaultfd) [IMPLEMENTED]
 
-Register the guest RAM memfd with userfaultfd and handle page faults lazily
-from the snapshot. This would reduce restore time to near-zero (only the
-pages actually touched by the guest during early boot would be copied).
-Expected benefit: **0ms initial restore** + ~0.05ms per page fault.
+Implemented via Linux `userfaultfd(O_CLOEXEC | O_NONBLOCK)` with `UFFDIO_REGISTER_MODE_MISSING`.
+Guest RAM memfd is registered with userfaultfd during `init()`. At restore time, only
+the virtqueue rings (< 12 pages) are pre-faulted, completely skipping the 29.8MB upfront
+memcpy. A background worker resolves guest memory access faults on demand (`UFFDIO_COPY`
+for dirty snapshot pages, `UFFDIO_ZEROPAGE` for clean pages).
+Achieved: **2.1ms - 3.4ms total VMM restore** (~0.3ms snapshot setup).
 
 ### 12.2 Pre-fork with COW
 

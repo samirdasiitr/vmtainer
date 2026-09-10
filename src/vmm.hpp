@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <linux/limits.h>
 #include <linux/kvm.h>
+#include <linux/userfaultfd.h>
+#include <sys/syscall.h>
 #include <asm/bootparam.h>
 
 #include "boot.hpp"
@@ -196,9 +198,20 @@ public:
 
     void set_copy_threads(int n) { copy_threads_ = n > 0 ? n : 1; }
     void set_hugetlb(bool v) { use_hugetlb_ = v; }
+    void set_uffd(bool v) { use_uffd_ = v; }
+    bool use_uffd() const { return use_uffd_; }
+    size_t uffd_fault_count() const { return uffd_fault_count_.load(); }
     void set_cmd_start(const struct timespec &ts) { t_cmd_start_ = ts; timing_entrypoint_ = true; }
     void set_vcpu_start(const struct timespec &ts) { t_vcpu_start_ = ts; }
+    bool timing_entrypoint() const { return timing_entrypoint_; }
     double time_to_entrypoint_ms() const { return time_to_entrypoint_ms_; }
+    double ms_since_start() const {
+        if (t_cmd_start_.tv_sec == 0) return 0.0;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        return (now.tv_sec - t_cmd_start_.tv_sec) * 1000.0 +
+               (now.tv_nsec - t_cmd_start_.tv_nsec) / 1000000.0;
+    }
 
 private:
     void cleanup();
@@ -328,4 +341,25 @@ private:
     bool entrypoint_measured_ = false;
     std::string serial_line_buf_;
     double time_to_entrypoint_ms_ = 0.0;
+
+    // userfaultfd (demand-paged lazy restore)
+    bool init_uffd();
+    void start_uffd_thread();
+    static void *uffd_worker_func(void *arg);
+    void uffd_worker();
+
+    int uffd_ = -1;
+    pthread_t uffd_thread_ = 0;
+    std::atomic<bool> uffd_running_{false};
+    int uffd_wakeup_fd_ = -1;
+    bool use_uffd_ = true;
+    std::atomic<size_t> uffd_fault_count_{0};
+
+    // Resident snapshot references for userfaultfd worker
+    void *snap_mmap_base_ = nullptr;
+    size_t snap_mmap_sz_ = 0;
+    int snap_fd_ = -1;
+    const uint8_t *snap_ram_ = nullptr;
+    std::vector<uint8_t> snap_bitmap_buf_;
+    size_t snap_total_pages_ = 0;
 };

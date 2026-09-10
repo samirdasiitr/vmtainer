@@ -275,7 +275,7 @@ bool Vmm::vu_connect(const char *sock_path) {
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
     // Retry connection with fast exponential backoff
-    for (int us = 1000; us <= 200000; us = std::min(us * 2, 200000)) {
+    for (int us = 50; us <= 50000; us = std::min(us * 2, 50000)) {
         if (connect(vu_sock_, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
             DBG("vu_connect: connected after backoff=%dus", us);
             return true;
@@ -472,12 +472,13 @@ bool Vmm::start_virtiofsd(const char *shared_dir) {
                "--socket-path", sock_path,
                "--shared-dir", shared_dir,
                "--sandbox", "none",
-               "--cache", "never",
+               "--cache", "auto",
                (char *)nullptr);
         perror("exec virtiofsd");
         _exit(1);
     }
 
+    if (timing_entrypoint_) printf("[+%6.2fms] ", ms_since_start());
     printf("[VMM] started virtiofsd (pid %d) sharing %s\n",
            virtiofsd_pid_, shared_dir);
 
@@ -493,6 +494,7 @@ bool Vmm::start_virtiofsd(const char *shared_dir) {
 
     setup_virtio_fs();
 
+    if (timing_entrypoint_) printf("[+%6.2fms] ", ms_since_start());
     printf("[VMM] virtiofs connected, tag='myfs'\n");
     return true;
 }
@@ -557,6 +559,7 @@ bool Vmm::setup_virtio_net(const uint8_t mac[6], bool add_cmdline) {
         strncat(cmdline_, mmio_param, sizeof(cmdline_) - strlen(cmdline_) - 1);
     }
 
+    if (timing_entrypoint_) printf("[+%6.2fms] ", ms_since_start());
     printf("[VMM] virtio-net: mac=%02x:%02x:%02x:%02x:%02x:%02x%s\n",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
            add_cmdline ? " (cmdline)" : " (restore)");
@@ -568,6 +571,7 @@ bool Vmm::connect_tap(const char *tap_name) {
     tap_fd_ = open_tap(tap_name);
     if (tap_fd_ < 0) return false;
     DBG("connect_tap: fd=%d", tap_fd_);
+    if (timing_entrypoint_) printf("[+%6.2fms] ", ms_since_start());
     printf("[VMM] TAP connected: %s\n", tap_name);
     return true;
 }
@@ -703,6 +707,7 @@ bool Vmm::vhost_net_setup() {
     pthread_create(&net_thread_, nullptr, net_thread_func, this);
     net_thread_running_ = true;
 
+    if (timing_entrypoint_) printf("[+%6.2fms] ", ms_since_start());
     printf("[VMM] virtio-net: userspace data path active\n");
     return true;
 }
