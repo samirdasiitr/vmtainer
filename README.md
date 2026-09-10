@@ -7,7 +7,7 @@ file, via any medium, is strictly prohibited.
 All rights reserved.
 -->
 
-# vmtainer: Design Document
+# vmtainer: boot a VM under 13ms
 
 ## 1. Overview
 
@@ -24,9 +24,9 @@ snapshot rather than booting from scratch. This reduces container startup from
 
 ### 1.1 Goals
 
-- **Sub-20ms container cold-start** from snapshot restore
+- **Sub-13ms container cold-start** from snapshot restore (achieved: **11.57ms**)
 - **Hardware-level isolation** (KVM) with container-like UX
-- **Minimal attack surface** (~2700 LOC single-file VMM, no QEMU)
+- **Minimal attack surface** (~2700 LOC modern C++ VMM, no QEMU)
 - **OCI image compatibility** via virtiofs rootfs sharing
 - **Kubernetes integration** via CRI plugin
 
@@ -101,20 +101,19 @@ vmtainer delivers **hardware virtualization with sub-12ms cold-start latency** b
                     +-----------------------+
 ```
 
-### 2.1 Component Summary
+### 3.1 Component Summary
 
 | Component | Language | LOC | Role |
 |-----------|----------|-----|------|
-| VMM (`vmm.cpp`) | C++17 | ~2700 | KVM setup, MMIO virtio, snapshot save/restore |
-| Guest init (`init`) | Shell | ~120 | Mount virtiofs, configure network, chroot, run entrypoint |
+| VMM (`vmm.cpp`, `virtio.cpp`) | C++17 | ~2700 | KVM setup, MMIO virtio, userfaultfd lazy restore |
+| Guest init (`init.c`) | C | ~300 | Static binary: mount virtiofs, network/hostname, bind mounts, chroot, execve |
 | Guest kernel | C (Linux 6.10) | - | Minimal config: serial, virtio-mmio, virtiofs, virtio-net |
 | CRI plugin | Go | ~2900 | Kubernetes RuntimeService + ImageService |
-| Kernel module | C | ~250 | vmalloc-backed snapshot for zero-miss restore |
-| Clone script | Bash | ~130 | Pull OCI image, extract rootfs, restore VM |
+| Clone script | Bash | ~150 | Pull OCI image, extract rootfs, restore VM |
 
-### 2.2 VMM Internals
+### 3.2 VMM Internals
 
-The VMM is a single C++ file implementing:
+The VMM is organized across `src/vmm.cpp` and `src/virtio.cpp` implementing:
 
 1. **KVM lifecycle**: `/dev/kvm` -> VM fd -> vCPU fd -> memslot -> run loop
 2. **Boot**: Load bzImage + initrd via Linux boot protocol, set up e820 map,
@@ -127,7 +126,7 @@ The VMM is a single C++ file implementing:
 5. **Virtio-net**: Userspace packet forwarding between virtqueue and TAP fd
    (dedicated pthread with poll loop)
 
-### 2.3 Memory Layout
+### 3.3 Memory Layout
 
 ```
 Guest Physical Address Map:
@@ -142,9 +141,9 @@ Guest Physical Address Map:
 ```
 
 RAM is backed by a memfd (anonymous shared memory), allowing zero-copy mmap
-into userspace and efficient snapshot restore via sparse copy.
+into userspace and efficient snapshot restore via userfaultfd demand-paging.
 
-## 3. Container Image Execution via virtiofs & Entrypoint
+## 4. Container Image Execution via virtiofs & Entrypoint
 
 vmtainer provides standard OCI/Docker container image compatibility without
 running a Docker daemon or container runtime inside the micro-VM. Standard
@@ -153,7 +152,7 @@ dedicated `virtiofsd` daemon, configured via metadata injection files
 (`.entrypoint` and `.vmconfig`), and executed inside an isolated `chroot`
 environment.
 
-### 3.1 Docker / OCI Image Extraction
+### 4.1 Docker / OCI Image Extraction
 
 Container images are pulled and flattened on the host to create a clean root
 filesystem (`rootfs`) for each container:
@@ -168,7 +167,7 @@ filesystem (`rootfs`) for each container:
    For CRI containers, `CreateContainer` copies or bind-mounts the cached rootfs into `/var/lib/vmtainer/containers/<container-id>/rootfs`, ensuring each container instance has its own isolated, writable filesystem tree.
 3. **Metadata Inspection**: The default entrypoint and command arguments are parsed from the image manifest (`Config.Entrypoint` and `Config.Cmd` via `docker inspect`, or CRI `Command` and `Args` specifications). If unspecified, it defaults to `/bin/sh`.
 
-### 3.2 Exposing Rootfs via virtiofs & vhost-user
+### 4.2 Exposing Rootfs via virtiofs & vhost-user
 
 Rather than attaching heavy block devices or formatting virtual disk images,
 vmtainer uses **virtiofs** (virtio-fs) to share the host directory directly with
@@ -220,7 +219,7 @@ the guest at near-native filesystem speed:
 3. **Zero-Copy Memory Sharing**: The guest RAM backing descriptor (`memfd`) is passed to `virtiofsd` across the Unix domain socket. This allows `virtiofsd` to directly read requests from guest virtqueues and write file data into guest physical memory without VMM bounce buffering.
 4. **MMIO Virtio Transport**: The VMM exposes virtiofs as a standard virtio-mmio device at base address `0xd0001000` (IRQ 5, Device ID 26).
 
-### 3.3 Configuration Injection (`.entrypoint` and `.vmconfig`)
+### 4.3 Configuration Injection (`.entrypoint` and `.vmconfig`)
 
 To keep guest startup fast and eliminate the need for heavy guest agents or extra virtual configuration devices, the host VMM injects configuration files directly into the root of the shared directory before launching the VM:
 
@@ -240,7 +239,7 @@ To keep guest startup fast and eliminate the need for heavy guest agents or extr
    ENV_NODE_ENV=production
    ```
 
-### 3.4 Snapshot Decoupling & Clean FUSE Handshake
+### 4.4 Snapshot Decoupling & Clean FUSE Handshake
 
 The snapshot-restore architecture requires careful coordination with virtiofs:
 
@@ -248,47 +247,49 @@ The snapshot-restore architecture requires careful coordination with virtiofs:
 - **Deterministic Signal Timing**: In vmtainer, the golden snapshot is taken in the guest `init` script **immediately after** kernel drivers are initialized, but **before** `mount -t virtiofs` is called.
 - **Clean Restores**: When `vmtainer restore` is invoked, the VMM launches a fresh `virtiofsd` daemon pointed at the new container's rootfs. When the vCPU resumes execution from the snapshot, the guest `init` executes `mount -t virtiofs myfs /share` against the newly initialized `virtiofsd`, establishing a clean, valid FUSE session every time.
 
-### 3.5 Guest Init Sequence: Mount, Chroot, and Execution
+### 4.5 Guest Init Sequence: Mount, Chroot, and Execution
 
-Once restored, the guest `init` process (`PID 1` inside the initrd) executes the container lifecycle:
+Once restored, the compiled static C init binary (`PID 1` inside `initrd`, compiled from `initrd_src/init.c`) executes the container lifecycle directly via Linux kernel syscalls:
 
 1. **Mount virtiofs**:
-   ```sh
-   mount -t virtiofs myfs /share
+   ```c
+   mount("myfs", "/share", "virtiofs", 0, NULL);
    ```
-2. **Load Configuration**:
-   - Reads the entrypoint command from `/share/.entrypoint`.
-   - Sources network, hostname, and environment parameters from `/share/.vmconfig`.
+   Because the FUSE driver was initialized prior to the snapshot, this mount completes in **0.26ms**.
+2. **Read Injected Configuration**:
+   - Reads container entrypoint string from `/share/.entrypoint`.
+   - Parses network parameters, hostname, and environment variables from `/share/.vmconfig` in-memory.
 3. **Configure Network & Host**:
-   - Sets the hostname via `/proc/sys/kernel/hostname`.
-   - Brings up `eth0`, assigns `$NET_IP`, and adds the default gateway `$NET_GW`.
+   - Assigns hostname via `sethostname()`.
+   - Brings up `eth0`, assigns IP address, netmask, and default route via `ioctl(SIOCSIFFLAGS/SIOCSIFADDR/SIOCSIFNETMASK/SIOCADDRT)`.
 4. **Pseudo-Filesystem Preparation**:
-   Prepares virtual filesystems inside the container rootfs:
-   ```sh
-   mkdir -p /share/proc /share/sys /share/dev /share/tmp
-   mount --move /proc /share/proc || mount -t proc proc /share/proc
-   mount --move /sys  /share/sys  || mount -t sysfs sysfs /share/sys
-   mount --move /dev  /share/dev  || mount -t devtmpfs devtmpfs /share/dev
-   [ -e /share/dev/kmsg ] || mknod /share/dev/kmsg c 1 11
+   Bind-mounts host virtual filesystems directly into the container rootfs:
+   ```c
+   mount("/proc", "/share/proc", NULL, MS_BIND, NULL);
+   mount("/sys",  "/share/sys",  NULL, MS_BIND, NULL);
+   mount("/dev",  "/share/dev",  NULL, MS_BIND, NULL);
+   mount("devpts", "/share/dev/pts", "devpts", 0, NULL);
    ```
-5. **Environment Export**:
-   Iterates through all variables matching `ENV_*` in `.vmconfig` and exports them (e.g., `ENV_PORT=8080` becomes `export PORT=8080`).
-6. **Chroot and Entrypoint Execution**:
+   Standard device permissions (`/share/dev/null`, `/share/dev/zero`, `/share/dev/console`, `/share/dev/urandom`) are set in-process.
+5. **Chroot and Entrypoint Execution**:
    Switches into the container filesystem and executes the target entrypoint:
-   ```sh
-   chroot /share $ENTRYPOINT
-   RC=$?
+   ```c
+   chroot("/share");
+   chdir("/");
+   execve("/bin/sh", argv, environ);
    ```
-7. **Clean VM Halt**:
-   When the entrypoint process exits, `init` logs `entrypoint exited ($RC)` to `/dev/kmsg` and halts the machine:
-   ```sh
-   exec /bin/halt -f
+   *(For distroless images lacking `/bin/sh`, direct execution of the binary fallback is executed).*
+6. **Clean VM Halt**:
+   When the entrypoint process exits, PID 1 waits on the child (`waitpid()`), logs the exit code, syncs filesystems, and halts the machine:
+   ```c
+   sync();
+   reboot(RB_POWER_OFF);
    ```
    The kernel halts, KVM traps VM shutdown, and the VMM collects the container exit code and terminates `virtiofsd`.
 
-## 4. Snapshot Format
+## 5. Snapshot Format
 
-### 4.1 Header (v7)
+### 5.1 Header (v7)
 
 The snapshot is a single flat file containing all KVM state needed to restore
 a vCPU + VM to its exact pre-snapshot state.
@@ -324,7 +325,7 @@ Total for default config: ~65 MB (4000B header + 8192B xsave +
   2080B cpuid + 1264B msrs + 2048B bitmap + 64MB RAM)
 ```
 
-### 4.2 Dirty Page Bitmap
+### 5.2 Dirty Page Bitmap
 
 On snapshot save, every 4KB page of guest RAM is scanned with a fast
 64-bit OR-reduce. Non-zero pages are marked in a bitmap (1 bit per page).
@@ -332,31 +333,31 @@ For 64MB RAM, the bitmap is 2048 bytes (16384 pages).
 
 Typical dirty ratio: **~46%** (7458/16384 pages = 29MB of 64MB).
 
-On restore, only dirty pages are copied, saving both time (skip zero-page
-reads) and physical memory (memfd pages stay zero until written).
+On restore, only dirty pages are demand-paged or copied, saving both time
+and physical memory (memfd pages stay zero until written).
 
-## 5. Snapshot Restore Pipeline
+## 6. Snapshot Restore Pipeline
 
 ```
 restore_snapshot_file(path):
   1. mmap(snapshot_file, PROT_READ, MAP_PRIVATE)     [0 ms - lazy]
   2. parse header, xsave, cpuid, msrs, bitmap        [< 0.1 ms]
-  3. init KVM (VM fd, vCPU fd, memfd, memslot)        [0.3-0.8 ms]
+  3. init KVM (VM fd, vCPU fd, memfd, memslot)        [0.6-1.3 ms]
   4. start virtiofsd + vhost-user handshake            [1.2-1.6 ms]
-  5. open TAP device                                   [0.1 ms]
-  6. sparse RAM copy (bitmap-guided)                   [10-14 ms]
-     - for each set bit in bitmap:
-         memcpy(dst + pg*4096, src + pg*4096, 4096)
-  7. restore KVM state (regs, sregs, CPUID, MSRs...)   [< 0.5 ms]
+  5. open TAP device                                   [0.1-0.2 ms]
+  6. userfaultfd memory registration + ring pre-fault  [0.2-0.3 ms]
+     (fallback: 8-thread coalesced memcpy ~4.5ms)
+  7. restore KVM state (regs, sregs, CPUID, MSRs...)   [< 0.1 ms]
   8. restore virtio device state                        [< 0.1 ms]
   9. start net thread + resume vCPU                     [< 0.1 ms]
 
-Total: ~13 ms (warm cache)
+Total VMM restore: ~2.7 - 3.3 ms (warm cache)
+Time to Container Entrypoint: 11.57 ms (nonet) / 18.9 ms (with network)
 ```
 
-## 6. Optimization History
+## 7. Optimization History & Benchmarks
 
-### 6.1 Timeline
+### 7.1 Timeline
 
 | # | Optimization | Before | After | Speedup |
 |---|-------------|--------|-------|---------|
@@ -372,7 +373,7 @@ Total: ~13 ms (warm cache)
 | 10 | Static C init binary (eliminated 10 guest forks) | 22.5ms guest | 1.80ms guest | 14x |
 | 11 | Nonet fast-path (skip synchronous network link-up) | 18.9ms E2E | **11.57ms E2E** | 1.6x |
 
-### 6.2 Current Breakdown (Single VM, Warm Cache)
+### 7.2 Current Breakdown (Single VM, Warm Cache)
 
 #### userfaultfd Demand-Paged Mode (Default)
 ```
@@ -402,7 +403,7 @@ KVM state restore   < 0.1        <1%
 Total VMM restore   ~7.3-8.5     100%
 ```
 
-### 6.3 Guest In-Process Initialization Breakdown: C Init vs Busybox Shell
+### 7.3 Guest In-Process Initialization Breakdown: C Init vs Busybox Shell
 
 Replacing the traditional Busybox shell script with a compiled static C binary (`initrd_src/init.c`) eliminated 10 sequential `fork()` and `execve()` process invocations inside the single-vCPU guest:
 
@@ -413,7 +414,7 @@ Replacing the traditional Busybox shell script with a compiled static C binary (
 | **Chroot & Bind Mounts** | ~8.3 ms | **0.19 ms** | **~44x faster** |
 | **Total Guest Init** | **~22.5 ms** | **1.80 ms** | **14x faster** |
 
-### 6.4 Network Overhead Breakdown: Full Networking vs `nonet`
+### 7.4 Network Overhead Breakdown: Full Networking vs `nonet`
 
 | Phase | With Network (`tap0` + IP setup) | Without Network (`nonet`) | Latency Saved |
 |---|---|---|---|
@@ -424,7 +425,7 @@ Replacing the traditional Busybox shell script with a compiled static C binary (
 | **Guest Chroot & Bind Mounts** | 0.40ms | **0.19ms** | ~0.2ms |
 | **Time to Entrypoint Execution** | **~18.9ms – 23.0ms** | **11.57ms** (p50: ~14.8ms) | **~7.3ms – 11.5ms faster** |
 
-### 6.5 End-to-End Timestamped Clone Execution Traces
+### 7.5 End-to-End Timestamped Clone Execution Traces
 
 #### Sub-12ms Run (Nonet Mode: 11.57ms to Entrypoint Start)
 ```
@@ -479,51 +480,6 @@ reboot: Power off not available: System halted instead
   Total E2E time:     118ms
   Exit code:          0
 ```
-
-## 7. Kernel Module: vmalloc-backed Snapshot
-
-### 7.1 Design
-
-The `vmtainer_snap` kernel module creates `/dev/vmtainer_snap`, a character
-device that allocates vmalloc memory and maps it to userspace. The snapshot
-is loaded once into this always-resident buffer, eliminating page cache
-misses on restore.
-
-```c
-// Allocate
-ioctl(fd, VMTAINER_SNAP_ALLOC, &size);  // vmalloc_user(size)
-// Map into userspace
-void *buf = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-// remap_vmalloc_range() gives zero-copy access
-```
-
-### 7.2 Benchmark Results
-
-Sparse copy of 29MB (7458 dirty pages) from various source types to a memfd:
-
-```
-Method                    Min      Avg      Max      Notes
-------                    ---      ---      ---      -----
-kmod vmalloc (warm)      5.77ms   6.22ms   9.12ms   Always-resident kernel pages
-file mmap (warm)         5.74ms   6.80ms   8.19ms   Page cache hit
-file mmap (cold)        50.28ms  94.39ms  109.2ms   Disk I/O (NVMe SSD)
-file read (warm)         5.74ms   5.89ms   6.05ms   Buffered I/O, cache hit
-file read (cold)         6.03ms   6.20ms   6.65ms   read() triggers readahead
-```
-
-**Key Finding**: When the snapshot is in the page cache (warm), all methods
-converge to ~6ms -- this is the raw memcpy bandwidth for 29MB. The kmod
-provides a **guaranteed warm-cache behavior** (no cold-cache penalty of
-50-110ms), but the same effect can be achieved with `mlock()` or
-`MAP_LOCKED` on a regular file mmap.
-
-### 7.3 Conclusion
-
-The vmalloc kernel module eliminates cold-cache variance but does not improve
-warm-cache performance. For production use, pre-warming the snapshot via
-`posix_fadvise(POSIX_FADV_WILLNEED)` or `mlock()` is simpler and equally
-effective. The kmod is useful for **guaranteed latency SLOs** where page cache
-eviction is a concern.
 
 ## 8. Parallel Clone Benchmark
 
@@ -715,37 +671,28 @@ Logged events:
 
 ## 12. Future Work
 
-### 12.1 Demand-Paged Restore (userfaultfd) [IMPLEMENTED]
-
-Implemented via Linux `userfaultfd(O_CLOEXEC | O_NONBLOCK)` with `UFFDIO_REGISTER_MODE_MISSING`.
-Guest RAM memfd is registered with userfaultfd during `init()`. At restore time, only
-the virtqueue rings (< 12 pages) are pre-faulted, completely skipping the 29.8MB upfront
-memcpy. A background worker resolves guest memory access faults on demand (`UFFDIO_COPY`
-for dirty snapshot pages, `UFFDIO_ZEROPAGE` for clean pages).
-Achieved: **2.1ms - 3.4ms total VMM restore** (~0.3ms snapshot setup).
-
-### 12.2 Pre-fork with COW
+### 12.1 Pre-fork with COW
 
 For the `clone` command, load the golden snapshot in a parent process and
 `fork()` for each clone. The forked child inherits the parent's RAM via
-COW (copy-on-write) page tables, avoiding the 29MB memcpy entirely.
+COW (copy-on-write) page tables, avoiding upfront memory setup entirely.
 The child then creates its own KVM VM and maps the inherited RAM.
-Expected benefit: **~2ms restore** (KVM init + virtiofsd only, no memcpy).
+Expected benefit: **~1.5ms restore** (KVM init + virtiofsd only).
 
-### 12.3 Compressed Snapshots
+### 12.2 Compressed Snapshots
 
 Store only dirty pages in the snapshot file (skip zero pages entirely).
-Would reduce file size from 65MB to ~30MB, improving cold-cache restore.
+Reduces file size from 65MB to ~30MB, improving cold-cache restore.
 Could also apply LZ4 compression for further reduction.
 
-### 12.4 Huge Pages (2MB)
+### 12.3 Huge Pages (2MB)
 
 Using 2MB huge pages for guest RAM would:
-- Reduce TLB misses during memcpy (16 TLB entries vs 7458)
-- Reduce page fault count during restore
+- Reduce TLB misses during memory access (16 TLB entries vs 7458)
+- Reduce page fault count during demand-paged restore
 - Improve guest execution performance
 
-### 12.5 vhost-net Kernel Data Path
+### 12.4 vhost-net Kernel Data Path
 
 Currently virtio-net uses a userspace packet forwarding thread. Switching
 to the kernel vhost-net data path (`/dev/vhost-net`) would:
@@ -756,25 +703,24 @@ to the kernel vhost-net data path (`/dev/vhost-net`) would:
 ## 13. File Inventory
 
 ```
-src/vmm.cpp                    VMM implementation (C++17, ~2740 LOC)
+src/vmm.cpp                    VMM core implementation (C++17, ~2700 LOC)
+src/vmm.hpp                    VMM class and snapshot data structures
+src/virtio.cpp                 Virtiofs & virtio-net transport and backoff logic
+src/virtio.hpp                 Virtio device transport definitions
 src/boot.hpp                   Linux boot protocol helpers
 src/bios_rom.h, bios.bin       Custom minimal BIOS
-initrd_src/init                Guest init script (shell)
-scripts/build_vmm.sh           Build script
-scripts/build_kernel.sh         Kernel build script
-scripts/build_initrd.sh         initrd build script
+initrd_src/init.c              Static C guest init binary (~300 LOC)
+scripts/build_vmm.sh           Build script for VMM
+scripts/build_kernel.sh        Kernel build script
+scripts/build_initrd.sh        initrd build script (compiles init.c statically)
 scripts/clone.sh               OCI image clone helper
 images/bzImage                 Compiled kernel
-images/initrd.cpio.gz          initrd with busybox + init
+images/initrd.cpio.gz          initrd with static C init
 images/golden.snap             Golden snapshot (~65MB)
-kmod/vmtainer_snap.c           Kernel module for resident snapshot
-kmod/vmtainer_snap.h           Shared ioctl header
-kmod/snap_bench.c              Restore benchmark tool
-kmod/Makefile                  Kernel module makefile
 cri/cmd/vmtainer-cri/main.go   CRI gRPC server
 cri/pkg/runtime/runtime.go     RuntimeService implementation
 cri/pkg/runtime/image.go       ImageService implementation
 cri/pkg/vmm/vmm.go             vmtainer binary wrapper
-cri/pkg/store/store.go          Metadata store
-cri/pkg/network/cni.go          Network management
+cri/pkg/store/store.go         Metadata store
+cri/pkg/network/cni.go         Network management
 ```
