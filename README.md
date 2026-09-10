@@ -723,4 +723,13 @@ cri/pkg/runtime/image.go       ImageService implementation
 cri/pkg/vmm/vmm.go             vmtainer binary wrapper
 cri/pkg/store/store.go         Metadata store
 cri/pkg/network/cni.go         Network management
+LICENSE                        Proprietary license and commercial use terms
 ```
+
+## 14. License & Commercial Use
+
+Copyright (c) 2026 Samir Das. All rights reserved.
+
+This project is proprietary and confidential. **If you need to use it in any commercial product, please reach out to Samir Das** ([samiruor@gmail.com](mailto:samiruor@gmail.com)).
+
+See [LICENSE](LICENSE) for the full license terms.
