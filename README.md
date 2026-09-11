@@ -9,6 +9,79 @@ All rights reserved.
 
 # vmtainer: boot a VM under 13ms
 
+Minimal, ultra-fast KVM-based micro-VM container runtime that boots full Linux micro-VMs in ~11–13ms using deterministic post-kernel golden snapshots.
+
+---
+
+## Table of Contents
+
+- [1. Overview](#1-overview)
+  - [1.1 Goals](#11-goals)
+  - [1.2 Non-Goals](#12-non-goals)
+- [2. Fast-Boot Architecture: What vmtainer Does Differently](#2-fast-boot-architecture-what-vmtainer-does-differently)
+  - [2.1 Deterministic Post-Kernel Golden Snapshot](#21-deterministic-post-kernel-golden-snapshot)
+  - [2.2 Demand-Paged Memory via `userfaultfd` (Overcoming DDR Bandwidth Limits)](#22-demand-paged-memory-via-userfaultfd-overcoming-ddr-bandwidth-limits)
+  - [2.3 Compiled Static C `init` (Eliminating 10 Guest Process Invocations)](#23-compiled-static-c-init-eliminating-10-guest-process-invocations)
+  - [2.4 Pre-Warmed Fast Virtiofs Synchronization](#24-pre-warmed-fast-virtiofs-synchronization)
+  - [2.5 Snapshot Decoupling & Clean FUSE Protocol Handshake](#25-snapshot-decoupling--clean-fuse-protocol-handshake)
+  - [2.6 Ultra-Minimalist Single-Threaded Micro-VMM (~2700 LOC)](#26-ultra-minimalist-single-threaded-micro-vmm-2700-loc)
+- [3. Architecture](#3-architecture)
+  - [3.1 Component Summary](#31-component-summary)
+  - [3.2 VMM Internals](#32-vmm-internals)
+  - [3.3 Memory Layout](#33-memory-layout)
+- [4. Quick Start & Usage Guide](#4-quick-start--usage-guide)
+  - [4.1 Prerequisites & System Requirements](#41-prerequisites--system-requirements)
+  - [4.2 Building the Components](#42-building-the-components)
+  - [4.3 Generating the Deterministic Golden Snapshot](#43-generating-the-deterministic-golden-snapshot)
+  - [4.4 Quick Container Execution with `clone.sh` (Fastest Path)](#44-quick-container-execution-with-clonesh-fastest-path)
+  - [4.5 Manual Image Pull, Rootfs Preparation & Direct VMM Restore](#45-manual-image-pull-rootfs-preparation--direct-vmm-restore)
+  - [4.6 High-Density Parallel Cloning (`vmtainer clone`)](#46-high-density-parallel-cloning-vmtainer-clone)
+  - [4.7 Kubernetes CRI Runtime Usage](#47-kubernetes-cri-runtime-usage)
+- [5. Container Image Execution via virtiofs & Entrypoint](#5-container-image-execution-via-virtiofs--entrypoint)
+  - [5.1 Docker / OCI Image Extraction](#51-docker--oci-image-extraction)
+  - [5.2 Exposing Rootfs via virtiofs & vhost-user](#52-exposing-rootfs-via-virtiofs--vhost-user)
+  - [5.3 Configuration Injection (`.entrypoint` and `.vmconfig`)](#53-configuration-injection-entrypoint-and-vmconfig)
+  - [5.4 Snapshot Decoupling & Clean FUSE Handshake](#54-snapshot-decoupling--clean-fuse-handshake)
+  - [5.5 Guest Init Sequence: Mount, Chroot, and Execution](#55-guest-init-sequence-mount-chroot-and-execution)
+- [6. Snapshot Format](#6-snapshot-format)
+  - [6.1 Header (v7)](#61-header-v7)
+  - [6.2 Dirty Page Bitmap](#62-dirty-page-bitmap)
+- [7. Snapshot Restore Pipeline](#7-snapshot-restore-pipeline)
+- [8. Optimization History & Benchmarks](#8-optimization-history--benchmarks)
+  - [8.1 Timeline](#81-timeline)
+  - [8.2 Current Breakdown (Single VM, Warm Cache)](#82-current-breakdown-single-vm-warm-cache)
+  - [8.3 Guest In-Process Initialization Breakdown: C Init vs Busybox Shell](#83-guest-in-process-initialization-breakdown-c-init-vs-busybox-shell)
+  - [8.4 Network Overhead Breakdown: Full Networking vs `nonet`](#84-network-overhead-breakdown-full-networking-vs-nonet)
+  - [8.5 End-to-End Timestamped Clone Execution Traces](#85-end-to-end-timestamped-clone-execution-traces)
+- [9. Parallel Clone Benchmark](#9-parallel-clone-benchmark)
+  - [9.1 Setup](#91-setup)
+  - [9.2 Restore-Only Results (VMM restore time only)](#92-restore-only-results-vmm-restore-time-only)
+  - [9.3 Full E2E Results (guest runs /bin/true and halts)](#93-full-e2e-results-guest-runs-bintrue-and-halts)
+  - [9.4 Detailed Breakdown at 100 Concurrent VMs (Full E2E)](#94-detailed-breakdown-at-100-concurrent-vms-full-e2e)
+  - [9.5 Detailed Breakdown at 1000 Concurrent VMs (Restore-Only)](#95-detailed-breakdown-at-1000-concurrent-vms-restore-only)
+  - [9.6 Scaling Analysis](#96-scaling-analysis)
+  - [9.7 Recommendations for Production](#97-recommendations-for-production)
+- [10. Memory Expansion Benchmark: Scaling Clones up to 512MB+](#10-memory-expansion-benchmark-scaling-clones-up-to-512mb)
+  - [10.1 The Memory Expansion Challenge in Cloned Micro-VMs](#101-the-memory-expansion-challenge-in-cloned-micro-vms)
+  - [10.2 The Three Architectural Approaches Tested](#102-the-three-architectural-approaches-tested)
+  - [10.3 Benchmark Results: 200MB Memory Expansion Workload](#103-benchmark-results-200mb-memory-expansion-workload)
+  - [10.4 Benchmark Results: Lightweight Container Workload (`/entrypoint.sh`)](#104-benchmark-results-lightweight-container-workload-entrypointsh)
+  - [10.5 Architectural Takeaways & Analysis](#105-architectural-takeaways--analysis)
+- [11. Guest Kernel Configuration](#11-guest-kernel-configuration)
+- [12. CRI Plugin Architecture](#12-cri-plugin-architecture)
+  - [12.1 Pod Sandbox Lifecycle](#121-pod-sandbox-lifecycle)
+  - [12.2 Key Design Decisions](#122-key-design-decisions)
+- [13. Debug Logging](#13-debug-logging)
+- [14. Future Work](#14-future-work)
+  - [14.1 Pre-fork with COW](#141-pre-fork-with-cow)
+  - [14.2 Compressed Snapshots](#142-compressed-snapshots)
+  - [14.3 Huge Pages (2MB)](#143-huge-pages-2mb)
+  - [14.4 vhost-net Kernel Data Path](#144-vhost-net-kernel-data-path)
+- [15. File Inventory](#15-file-inventory)
+- [16. License & Commercial Use](#16-license--commercial-use)
+
+---
+
 ## 1. Overview
 
 vmtainer is a minimal KVM-based micro-VM runtime that provides container-like
