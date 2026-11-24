@@ -572,6 +572,14 @@ private:
 
     // Guest RAM backing fd (memfd) for sharing with virtiofsd
     int ram_memfd_ = -1;
+    bool use_hugetlb_ = false;
+
+    // Number of threads for parallel snapshot restore memcpy (default 2)
+    int copy_threads_ = 2;
+
+public:
+    void set_copy_threads(int n) { copy_threads_ = n > 0 ? n : 1; }
+    void set_hugetlb(bool v) { use_hugetlb_ = v; }
 };
 
 // ---------------------------------------------------------------------------
@@ -2022,16 +2030,72 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
         size_t total_pages = ram_bytes_ / PAGE;
 
         if (!snap.dirty_bitmap.empty()) {
-            // Fast path: bitmap-guided copy (no reads of zero pages)
+            // Fast path: bitmap-guided copy with run-length coalescing.
+            // Instead of copying one 4KB page at a time, we detect
+            // consecutive dirty pages and merge them into larger memcpy
+            // calls.  This amortizes the per-page fault overhead.
+
+            // If multiple threads requested, use parallel workers.
+            struct CopyWork {
+                const uint8_t *src;
+                uint8_t *dst;
+                const uint8_t *bitmap;
+                size_t pg_start;
+                size_t pg_end;
+                size_t dirty_count;
+            };
+
+            auto copy_worker = [](void *arg) -> void * {
+                auto *w = (CopyWork *)arg;
+                size_t count = 0;
+                size_t pg = w->pg_start;
+                while (pg < w->pg_end) {
+                    if (!(w->bitmap[pg / 8] & (1 << (pg & 7)))) { pg++; continue; }
+                    // Found a dirty page -- scan for consecutive run
+                    size_t run_start = pg;
+                    while (pg < w->pg_end &&
+                           (w->bitmap[pg / 8] & (1 << (pg & 7)))) {
+                        pg++;
+                    }
+                    size_t run_len = pg - run_start;
+                    count += run_len;
+                    memcpy(w->dst + run_start * 4096,
+                           w->src + run_start * 4096,
+                           run_len * 4096);
+                }
+                w->dirty_count = count;
+                return nullptr;
+            };
+
+            int NUM_COPY_THREADS = copy_threads_;
+            std::vector<CopyWork> work(NUM_COPY_THREADS);
+            std::vector<pthread_t> threads(NUM_COPY_THREADS);
+            size_t pages_per = total_pages / NUM_COPY_THREADS;
+
+            for (int t = 0; t < NUM_COPY_THREADS; t++) {
+                work[t].src = src;
+                work[t].dst = dst;
+                work[t].bitmap = snap.dirty_bitmap.data();
+                work[t].pg_start = t * pages_per;
+                work[t].pg_end = (t == NUM_COPY_THREADS - 1) ? total_pages : (t + 1) * pages_per;
+                work[t].dirty_count = 0;
+                if (NUM_COPY_THREADS > 1)
+                    pthread_create(&threads[t], nullptr, copy_worker, &work[t]);
+            }
+
             size_t dirty_count = 0;
-            for (size_t pg = 0; pg < total_pages; pg++) {
-                if (snap.dirty_bitmap[pg / 8] & (1 << (pg & 7))) {
-                    memcpy(dst + pg * PAGE, src + pg * PAGE, PAGE);
-                    dirty_count++;
+            if (NUM_COPY_THREADS == 1) {
+                copy_worker(&work[0]);
+                dirty_count = work[0].dirty_count;
+            } else {
+                for (int t = 0; t < NUM_COPY_THREADS; t++) {
+                    pthread_join(threads[t], nullptr);
+                    dirty_count += work[t].dirty_count;
                 }
             }
-            DBG("restore: bitmap copy %zu/%zu pages (%zuKB)",
-                dirty_count, total_pages, dirty_count * 4);
+
+            DBG("restore: bitmap copy %zu/%zu pages (%zuKB) [%d threads, coalesced]",
+                dirty_count, total_pages, dirty_count * 4, NUM_COPY_THREADS);
         } else {
             // Slow path: scan each page
             for (size_t off = 0; off < ram_bytes_; off += PAGE) {
@@ -2181,9 +2245,11 @@ bool Vmm::restore_snapshot_file(const char *path) {
     void *map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) { perror("mmap snap"); close(fd); return false; }
 
-    // Only readahead the header (first few KB) eagerly.
-    // RAM pages will be faulted in selectively via the dirty bitmap.
+    // Readahead only the header+metadata eagerly; RAM pages will be
+    // faulted in selectively via the dirty bitmap.
     madvise(map, std::min((size_t)st.st_size, (size_t)(256 * 1024)), MADV_WILLNEED);
+
+    clock_gettime(CLOCK_MONOTONIC, &tf1);
 
     const uint8_t *p = (const uint8_t *)map;
     size_t remain = st.st_size;
@@ -2607,6 +2673,8 @@ int main(int argc, char **argv) {
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
         Vmm vmm(64);
+        if (ct_str) vmm.set_copy_threads(atoi(ct_str));
+        if (has_flag(argc, argv, "--hugetlb")) vmm.set_hugetlb(true);
         if (!vmm.init(false)) return 1;  // skip zeroing -- snapshot overwrites RAM
         long us_init = us_since(t0);
 
