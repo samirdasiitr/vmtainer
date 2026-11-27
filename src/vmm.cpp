@@ -627,8 +627,17 @@ bool Vmm::init(bool zero_ram) {
         perror("KVM_CREATE_PIT2"); return false;
     }
 
-    // Allocate guest RAM via memfd so we can share it with virtiofsd
-    ram_memfd_ = memfd_create("guest_ram", MFD_CLOEXEC);
+    // Allocate guest RAM via memfd so we can share it with virtiofsd.
+    // Try hugetlb if requested (2MB pages = fewer faults), fall back to regular.
+    if (use_hugetlb_) {
+        ram_memfd_ = memfd_create("guest_ram", MFD_CLOEXEC | MFD_HUGETLB);
+        if (ram_memfd_ < 0) {
+            DBG("init: hugetlb memfd failed, falling back to regular");
+            use_hugetlb_ = false;
+        }
+    }
+    if (ram_memfd_ < 0)
+        ram_memfd_ = memfd_create("guest_ram", MFD_CLOEXEC);
     if (ram_memfd_ < 0) { perror("memfd_create"); return false; }
     if (ftruncate(ram_memfd_, ram_bytes_) < 0) {
         perror("ftruncate memfd"); return false;
@@ -2109,6 +2118,8 @@ bool Vmm::restore_snapshot(const Snapshot &snap) {
         }
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+
     // Restore CPUID
     size_t csz = sizeof(kvm_cpuid2) + h.cpuid_nent * sizeof(kvm_cpuid_entry2);
     free(cpuid_);
@@ -2294,7 +2305,20 @@ bool Vmm::restore_snapshot_file(const char *path) {
     // Don't readahead RAM pages -- bitmap-guided copy will be selective
     madvise((void *)p, snap.ram_size, MADV_RANDOM);
 
+    clock_gettime(CLOCK_MONOTONIC, &tf2);
+
     bool ok = restore_snapshot(snap);
+
+    clock_gettime(CLOCK_MONOTONIC, &tf3);
+
+    auto us_diff = [](struct timespec &a, struct timespec &b) -> long {
+        return (b.tv_sec - a.tv_sec) * 1000000L + (b.tv_nsec - a.tv_nsec) / 1000L;
+    };
+    DBG("restore_file breakdown: mmap=%.2fms parse=%.2fms restore=%.2fms total=%.2fms",
+        us_diff(tf0, tf1) / 1000.0,
+        us_diff(tf1, tf2) / 1000.0,
+        us_diff(tf2, tf3) / 1000.0,
+        us_diff(tf0, tf3) / 1000.0);
 
     // Don't let ~Snapshot munmap -- we own the mapping
     snap.ram = nullptr;
